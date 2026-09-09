@@ -1,0 +1,53 @@
+AMAZON FACTURES 2025 — V5 DIRECT
+================================
+
+PROBLÈME CORRIGÉ
+La V4 vérifiait le lien avec fetch() AVANT le téléchargement.
+Amazon peut renvoyer une page intermédiaire/authentifiée à cette requête,
+donc V4 pouvait rejeter toutes les factures et ne rien télécharger.
+
+V5 :
+1. repère uniquement les liens intitulés Facture / Facture 1 / Invoice...
+2. demande directement à Chrome de télécharger le lien ;
+3. Chrome utilise les cookies de la session Amazon connectée ;
+4. une fois le téléchargement terminé, V5 lit le vrai type MIME retourné ;
+5. si c'est PDF : le fichier reste ;
+6. si c'est HTML/non-PDF : le fichier est supprimé automatiquement ;
+7. le programme continue toujours avec la facture suivante.
+
+INSTALLATION
+1. Ouvrir chrome://extensions
+2. Supprimer V4 (et les anciennes V2/V3 si elles existent encore)
+3. Décompresser ce ZIP dans un dossier permanent
+4. Activer Mode développeur
+5. Cliquer « Charger l'extension non empaquetée »
+6. Choisir le dossier Amazon_Factures_2025_V5_DIRECT
+
+UTILISATION
+1. Se connecter à Amazon.fr
+2. Ouvrir l'extension
+3. Laisser 2025
+4. Cliquer « Ouvrir mes commandes 2025 »
+5. Puis « Télécharger automatiquement »
+6. Laisser Amazon ouvert
+
+INDICATEURS
+- Commandes analysées
+- Liens Facture détectés
+- Vrais PDF gardés
+- HTML/faux rejetés
+
+DOSSIER
+Téléchargements\Amazon_Factures_2025\
+
+À LA FIN
+Télécharger le rapport CSV. Il indique pour chaque commande :
+- nombre de liens Facture détectés,
+- vrais PDF gardés,
+- faux documents rejetés,
+- type MIME et taille du téléchargement.
+
+CONSEIL
+Pour le premier essai, regarde surtout les compteurs :
+si « liens Facture détectés » augmente mais « vrais PDF gardés » reste à zéro,
+le rapport CSV permettra d'identifier exactement ce qu'Amazon renvoie.

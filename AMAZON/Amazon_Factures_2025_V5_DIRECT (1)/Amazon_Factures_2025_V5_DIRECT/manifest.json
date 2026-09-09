@@ -1,0 +1,34 @@
+{
+  "manifest_version": 3,
+  "name": "Amazon Factures 2025 - V5 Direct",
+  "version": "5.0.0",
+  "description": "Télécharge directement les liens Facture Amazon.fr puis conserve uniquement les vrais PDF.",
+  "permissions": [
+    "downloads",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.amazon.fr/*"
+  ],
+  "action": {
+    "default_title": "Amazon Factures V5",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.amazon.fr/gp/your-account/order-history*",
+        "https://www.amazon.fr/your-orders/orders*",
+        "https://www.amazon.fr/gp/css/order-history*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}
