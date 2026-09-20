@@ -3,15 +3,25 @@
  * Conversion de la logique principale de CBC-2025.xlsm vers Apps Script.
  *
  * IMPORTANT :
- * - Les CSV CBC doivent être déposés dans un dossier Google Drive.
- * - Le script prend le fichier export_BE...csv le plus récent pour chaque compte.
+ * - Les CSV CBC doivent être déposés dans un dossier Google Drive sélectionné.
+ * - Le script parcourt aussi tous les sous-dossiers de ce dossier.
+ * - Il prend le fichier export_BE...csv le plus récent pour chaque compte.
+ * - Il détecte TOUS les exports « Mastercard Business Blue CBC », fusionne l'historique et alimente VISA-CBC.
  * - Il ne supprime pas l'historique des onglets société.
  * - Il reconstruit DIVERS-BANQUE à partir des derniers CSV et ajoute seulement les
  *   opérations absentes dans les onglets société.
+ * - L'ordre d'ajout suit l'ordre comptable réel du CSV CBC (ligne CSV décroissante).
+ * - Si un onglet bancaire contient déjà des écarts de vérification récents, le script
+ *   remet automatiquement le bloc concerné dans l'ordre du CSV, pour tous les comptes.
+ * - Toute correction/import est bloqué si l'ordre ne reproduit pas exactement les soldes CBC.
  */
 
 const CBC = Object.freeze({
-  VERSION: '2.1.4',
+  VERSION: '2.3.6',
+  SCAN_SUBFOLDERS: true,
+  MAX_SCAN_FOLDERS: 2000,
+  CSV_STALE_DAYS: 3,
+  PDF_NEWER_TOLERANCE_MINUTES: 5,
   TIMEZONE: 'Europe/Brussels',
   SEARCH_SHEET: 'RECHERCHE-CBC',
   SUPPLIER_RECON_SHEET: 'RAPPROCHEMENT-FOURNISSEUR',
@@ -27,6 +37,9 @@ const CBC = Object.freeze({
   DATA_START_ROW: 3,
   DATA_WIDTH: 14, // A:N dans les onglets banque
   DIVERS_WIDTH: 18, // A:R
+  CARD_ACCOUNTS: [
+    { key: 'MASTERCARD_BUSINESS_BLUE', sheet: 'VISA-CBC', filenameContains: 'MASTERCARD BUSINESS BLUE CBC' }
+  ],
   ACCOUNTS: [
     { iban: 'BE07732021748966', sheet: 'AS-CBC',       totauxRow: 6,  totalCorrection: -13.98 },
     { iban: 'BE24732066860838', sheet: 'WINPRO-CBC',   totauxRow: 8,  totalCorrection: 0 },
@@ -59,6 +72,11 @@ function onOpen() {
     .addSeparator()
     .addItem('📑 Rapprochement fournisseurs', 'ouvrirRapprochementFournisseur')
     .addItem('💶 Factures à payer', 'ouvrirFacturesAPayer')
+    .addSeparator()
+    .addItem('🧾 Contrôler un dossier de factures PDF...', 'amazonOuvrirControleFacturesPdf')
+    .addItem('▶️ Continuer contrôle factures PDF maintenant', 'amazonContinuerControleFacturesPdf')
+    .addItem('📈 État contrôle factures PDF', 'amazonAfficherEtatControle')
+    .addItem('⏹️ Arrêter contrôle factures PDF', 'amazonArreterControle')
     .addSeparator()
     .addItem('Configurer le dossier CSV', 'configurerDossierImports')
     .addItem('Vérifier la configuration', 'verifierConfiguration')
@@ -113,7 +131,7 @@ function configurerDossierImports() {
 <body>
   <div class="wrap">
     <h2>Choisir le dossier des exports CBC</h2>
-    <div class="hint">Ouvre les dossiers puis clique sur <b>Sélectionner ce dossier</b>. Aucune URL à copier.</div>
+    <div class="hint">Choisis le dossier racine où tu ranges tes exports CBC. Le programme cherchera aussi dans tous ses sous-dossiers. Aucune URL à copier.</div>
 
     <div class="toolbar">
       <button id="back" onclick="back()">← Retour</button>
@@ -253,15 +271,55 @@ function verifierConfiguration() {
   const ui = SpreadsheetApp.getUi();
   try {
     const folder = getImportFolder_();
-    const latest = getLatestCsvFiles_(folder);
+    const inventory = getLatestBankFiles_(folder);
+    const now = new Date();
+
     const lines = CBC.ACCOUNTS.map(a => {
-      const f = latest[a.iban];
-      return (f ? '✓ ' : '✗ ') + a.sheet + ' — ' + a.iban + (f ? '\n   ' + f.getName() : '\n   aucun CSV trouvé');
+      const info = inventory[a.iban] || {};
+      const csv = info.csv || null;
+      const pdf = info.pdf || null;
+      const csvDate = csv ? getBankFileDate_(csv) : null;
+      const pdfDate = pdf ? getBankFileDate_(pdf) : null;
+      const ageDays = csvDate ? ageDays_(csvDate, now) : null;
+      const warnings = [];
+
+      if (!csv) {
+        warnings.push(pdf
+          ? '⚠ PDF trouvé mais CSV manquant : ' + pdf.getName()
+          : '✗ aucun CSV trouvé');
+      } else {
+        if (ageDays !== null && ageDays > CBC.CSV_STALE_DAYS) {
+          warnings.push('⚠ CSV ancien : ' + ageDays + ' jour(s)');
+        }
+        if (pdf && pdfDate && csvDate &&
+            (pdfDate.getTime() - csvDate.getTime()) > CBC.PDF_NEWER_TOLERANCE_MINUTES * 60000) {
+          warnings.push('⚠ PDF plus récent : ' + pdf.getName());
+        }
+      }
+
+      return (csv ? '✓ ' : '✗ ') + a.sheet + ' — ' + a.iban +
+        (csv ? '\n   CSV : ' + csv.getName() : '') +
+        (warnings.length ? '\n   ' + warnings.join('\n   ') : '\n   OK');
+    });
+
+    CBC.CARD_ACCOUNTS.forEach(card => {
+      const info = inventory.__cards && inventory.__cards[card.key] ? inventory.__cards[card.key] : {};
+      const csv = info.csv || null;
+      const csvs = (info.csvs || []).map(x => x.file || x).filter(Boolean);
+      const csvDate = csv ? getBankFileDate_(csv) : null;
+      const ageDays = csvDate ? ageDays_(csvDate, now) : null;
+      const warnings = [];
+      if (!csv) warnings.push('✗ aucun CSV Mastercard trouvé');
+      else if (ageDays !== null && ageDays > CBC.CSV_STALE_DAYS) warnings.push('⚠ dernier CSV ancien : ' + ageDays + ' jour(s)');
+
+      lines.push((csv ? '✓ ' : '✗ ') + card.sheet + ' — Mastercard Business Blue' +
+        (csv ? '\n   CSV trouvés : ' + Math.max(1, csvs.length) + '\n   Plus récent : ' + csv.getName() : '') +
+        (warnings.length ? '\n   ' + warnings.join('\n   ') : '\n   OK'));
     });
 
     ui.alert(
       'Configuration CBC',
-      'Dossier : ' + folder.getName() + '\n\n' + lines.join('\n\n'),
+      'Dossier racine : ' + folder.getName() + '\nRecherche dans les sous-dossiers : OUI\n\n' + lines.join('\n\n'),
       ui.ButtonSet.OK
     );
   } catch (e) {
@@ -272,21 +330,28 @@ function verifierConfiguration() {
 function miseAJourCBC() {
   const ui = SpreadsheetApp.getUi();
   try {
-    getImportFolder_(); // vérifie la configuration avant la sauvegarde
+    getImportFolder_();
     creerSauvegardeQuotidienne_();
     const result = executerMiseAJour_(false);
 
-    ui.alert(
-      'Mise à jour CBC terminée',
+    let msg =
       'CSV lus : ' + result.filesRead + '\n' +
       'Opérations présentes dans les derniers CSV : ' + result.rowsParsed + '\n' +
+      'Lignes bancaires remises dans l’ordre CBC : ' + (result.rowsCorrected || 0) + '\n' +
       'Nouvelles opérations banque : ' + result.rowsAdded + '\n' +
-      'Nouvelles lignes GERICO : ' + result.gericoAdded + '\n\n' +
-      (result.rowsAdded === 0 && result.gericoAdded === 0
-        ? 'Aucune nouvelle opération : le classeur était déjà à jour.'
-        : 'Les onglets banque, GERICO et TOTAUX ont été mis à jour.'),
-      ui.ButtonSet.OK
-    );
+      'Nouvelles opérations VISA-CBC : ' + (result.visaAdded || 0) + '\n' +
+      'Nouvelles lignes GERICO : ' + result.gericoAdded;
+
+    if (result.warnings && result.warnings.length) {
+      msg += '\n\nATTENTION :\n' + result.warnings.map(w => '• ' + w).join('\n');
+    }
+
+    msg += '\n\n' +
+      (result.rowsAdded === 0 && (result.visaAdded || 0) === 0 && result.gericoAdded === 0 && !(result.rowsCorrected > 0)
+        ? 'Aucune nouvelle opération bancaire n’a été ajoutée.'
+        : 'Les onglets banque, GERICO et TOTAUX ont été mis à jour.');
+
+    ui.alert('Mise à jour CBC terminée', msg, ui.ButtonSet.OK);
   } catch (e) {
     ui.alert('Erreur CBC', e.message, ui.ButtonSet.OK);
     throw e;
@@ -298,7 +363,9 @@ function miseAJourCBCAuto() {
   try {
     executerMiseAJour_(true);
   } catch (e) {
-    console.error('CBC auto : ' + e.stack);
+    const msg = e && e.stack ? e.stack : String(e);
+    console.error('CBC auto : ' + msg);
+    journaliserErreurAuto_(msg);
   }
 }
 
@@ -308,22 +375,57 @@ function executerMiseAJour_(silent) {
 
   try {
     const ss = getSpreadsheet_();
+    corrigerFuseauHoraireCBC_(ss);
+    assurerOngletVisaCbc_(ss);
     verifierOngletsRequis_(ss);
     const folder = getImportFolder_();
-    const latest = getLatestCsvFiles_(folder);
+    const inventory = getLatestBankFiles_(folder);
+    const now = new Date();
 
     const allTransactions = [];
     const parsedBySheet = {};
     const journalRows = [];
+    const warnings = [];
     let filesRead = 0;
     let rowsParsed = 0;
+    let mastercardTransactions = [];
+    let mastercardFile = null;
+    let mastercardWarnings = [];
 
     CBC.ACCOUNTS.forEach(def => {
       parsedBySheet[def.sheet] = [];
-      const file = latest[def.iban];
+      const info = inventory[def.iban] || {};
+      const file = info.csv || null;
+      const pdf = info.pdf || null;
+      const csvDate = file ? getBankFileDate_(file) : null;
+      const pdfDate = pdf ? getBankFileDate_(pdf) : null;
+
       if (!file) {
-        journalRows.push([new Date(), '', def.iban, def.sheet, 0, 0, 'Aucun CSV trouvé']);
+        let status = 'Aucun CSV trouvé';
+        if (pdf) {
+          status += ' — PDF présent : ' + pdf.getName();
+          warnings.push(def.sheet + ' : PDF trouvé mais CSV manquant (' + pdf.getName() + ')');
+        } else {
+          warnings.push(def.sheet + ' : aucun CSV trouvé');
+        }
+        journalRows.push([new Date(), '', def.iban, def.sheet, 0, 0, status]);
         return;
+      }
+
+      const age = csvDate ? ageDays_(csvDate, now) : null;
+      const accountWarnings = [];
+
+      if (age !== null && age > CBC.CSV_STALE_DAYS) {
+        const txt = 'CSV ancien de ' + age + ' jour(s) : ' + file.getName();
+        accountWarnings.push(txt);
+        warnings.push(def.sheet + ' : ' + txt);
+      }
+
+      if (pdf && pdfDate && csvDate &&
+          (pdfDate.getTime() - csvDate.getTime()) > CBC.PDF_NEWER_TOLERANCE_MINUTES * 60000) {
+        const txt = 'PDF plus récent que le CSV : ' + pdf.getName();
+        accountWarnings.push(txt);
+        warnings.push(def.sheet + ' : ' + txt);
       }
 
       const parsed = parseCbcCsv_(file, def);
@@ -331,91 +433,251 @@ function executerMiseAJour_(silent) {
       rowsParsed += parsed.length;
       parsedBySheet[def.sheet] = parsed;
       parsed.forEach(t => allTransactions.push(t));
-      journalRows.push([new Date(), file.getName(), def.iban, def.sheet, parsed.length, '', 'CSV lu']);
+
+      journalRows.push([
+        new Date(), file.getName(), def.iban, def.sheet, parsed.length, '',
+        accountWarnings.length ? 'CSV lu — ' + accountWarnings.join(' | ') : 'CSV lu'
+      ]);
     });
 
+    const cardDef = CBC.CARD_ACCOUNTS[0];
+    const cardInfo = inventory.__cards && inventory.__cards[cardDef.key] ? inventory.__cards[cardDef.key] : {};
+    const mastercardFiles = (cardInfo.csvs || []).map(x => x.file || x).filter(Boolean);
+    mastercardFile = cardInfo.csv || (mastercardFiles.length ? mastercardFiles[mastercardFiles.length - 1] : null);
+
+    // Pour la carte, on lit TOUS les exports disponibles dans le dossier racine et ses sous-dossiers.
+    // Les historiques qui se chevauchent sont fusionnés sans multiplier les doublons.
+    if (mastercardFiles.length || mastercardFile) {
+      const files = mastercardFiles.length ? mastercardFiles : [mastercardFile];
+      const cardDate = mastercardFile ? getBankFileDate_(mastercardFile) : null;
+      const cardAge = cardDate ? ageDays_(cardDate, now) : null;
+      if (cardAge !== null && cardAge > CBC.CSV_STALE_DAYS) {
+        const txt = 'Dernier CSV Mastercard ancien de ' + cardAge + ' jour(s) : ' + mastercardFile.getName();
+        mastercardWarnings.push(txt);
+        warnings.push('VISA-CBC : ' + txt);
+      }
+
+      const lists = [];
+      files.forEach(file => {
+        const parsed = parseMastercardBusinessCsv_(file);
+        lists.push(parsed);
+        filesRead++;
+        rowsParsed += parsed.length;
+      });
+      mastercardTransactions = fusionnerTransactionsVisaFichiers_(lists);
+    } else {
+      warnings.push('VISA-CBC : aucun CSV Mastercard Business Blue trouvé');
+    }
+
     if (filesRead === 0) {
+      ecrireJournal_(ss, journalRows);
       throw new Error(
         'Aucun fichier CSV CBC n’a été trouvé dans le dossier configuré.\n\n' +
-        'Les noms attendus contiennent par exemple : export_BE07732021748966_...csv'
+        'Les PDF ne sont pas utilisés pour importer les opérations bancaires.\n' +
+        'Il faut déposer les exports CBC au format CSV dans le dossier configuré.'
       );
     }
 
-    // Comme la macro Excel : DIVERS-BANQUE reflète les derniers CSV lus.
     ecrireDiversBanque_(ss, allTransactions);
 
     let rowsAdded = 0;
+    let rowsCorrected = 0;
     const summaries = [];
     const addedBySheet = {};
+    const correctedBySheet = {};
 
     CBC.ACCOUNTS.forEach(def => {
       const sheet = ss.getSheetByName(def.sheet);
-      const added = ajouterNouvellesOperations_(sheet, parsedBySheet[def.sheet] || [], def);
+      const transactions = parsedBySheet[def.sheet] || [];
+
+      // Corrige d'abord, pour TOUS les comptes, un éventuel bloc récent déjà importé
+      // dans un mauvais ordre. Aucun menu de réparation séparé n'est nécessaire.
+      const correction = corrigerOrdreRecentCompte_(sheet, transactions, def);
+      const corrected = correction.corrected || 0;
+      rowsCorrected += corrected;
+      correctedBySheet[def.sheet] = corrected;
+
+      const added = ajouterNouvellesOperations_(sheet, transactions, def);
       rowsAdded += added;
       addedBySheet[def.sheet] = added;
+
+      // Élimine les micro-écarts de virgule flottante (ex. 0,00000000001) en N.
+      normaliserMicroEcartsVerification_(sheet);
+      ecrireTotal_(sheet, def);
       summaries.push(calculerResumeOnglet_(sheet, def));
     });
 
-    // Synchronise aussi l'onglet GERICO depuis AS-CBC.
+    let visaAdded = 0;
+    if (mastercardFile) {
+      const visaResult = mettreAJourVisaCbc_(ss, mastercardTransactions);
+      visaAdded = visaResult.added || 0;
+      const cardInfoForJournal = inventory.__cards && inventory.__cards[cardDef.key] ? inventory.__cards[cardDef.key] : {};
+      const cardFileCount = Math.max(1, (cardInfoForJournal.csvs || []).length);
+      journalRows.push([
+        new Date(), cardFileCount + ' CSV Mastercard — dernier : ' + mastercardFile.getName(),
+        'Mastercard Business Blue', 'VISA-CBC',
+        mastercardTransactions.length, visaAdded,
+        (visaAdded > 0 ? 'Import carte OK' : 'Déjà à jour') +
+        (mastercardWarnings.length ? ' — ' + mastercardWarnings.join(' | ') : '')
+      ]);
+    }
+
     const gericoResult = mettreAJourGerico_(ss, { silent: true });
     const gericoAdded = gericoResult.added || 0;
 
-    // On ne déplace Actuel -> Précédent que si au moins une nouvelle opération bancaire a réellement été ajoutée.
     mettreAJourTotaux_(ss, summaries, rowsAdded > 0);
     SpreadsheetApp.flush();
 
-    // Complète le journal avec le nombre réellement ajouté par onglet.
     journalRows.forEach(r => {
       if (r[3] && addedBySheet[r[3]] !== undefined) {
         r[5] = addedBySheet[r[3]];
-        if (r[6] === 'CSV lu') r[6] = addedBySheet[r[3]] > 0 ? 'Import OK' : 'Déjà à jour';
+        if (String(r[6] || '').indexOf('CSV lu') === 0) {
+          const suffix = String(r[6] || '').replace(/^CSV lu\s*[—-]?\s*/, '');
+          const corrected = correctedBySheet[r[3]] || 0;
+          let base = addedBySheet[r[3]] > 0 ? 'Import OK' : 'Déjà à jour';
+          if (corrected > 0) base += ' — ordre corrigé : ' + corrected + ' ligne(s)';
+          r[6] = suffix ? base + ' — ' + suffix : base;
+        }
       }
     });
     ecrireJournal_(ss, journalRows);
 
-    if (!silent) ss.toast('CBC : ' + rowsAdded + ' opération(s) banque + ' + gericoAdded + ' ligne(s) GERICO.', 'CBC BANQUE', 5);
-    return { filesRead, rowsParsed, rowsAdded, gericoAdded };
+    if (!silent) {
+      ss.toast(
+        'CBC : ' + rowsCorrected + ' ligne(s) corrigée(s), ' + rowsAdded +
+        ' opération(s) banque + ' + visaAdded + ' opération(s) VISA-CBC + ' + gericoAdded + ' ligne(s) GERICO' +
+        (warnings.length ? ' — ' + warnings.length + ' alerte(s)' : '') + '.',
+        'CBC BANQUE',
+        7
+      );
+    }
+
+    return { filesRead, rowsParsed, rowsCorrected, rowsAdded, visaAdded, gericoAdded, warnings };
   } finally {
     lock.releaseLock();
   }
 }
 
-function getLatestCsvFiles_(folder) {
-  const selected = {};
-  const ranks = {};
+function getLatestBankFiles_(folder) {
+  const out = { __cards: {} };
   const known = {};
-  CBC.ACCOUNTS.forEach(a => known[a.iban] = true);
+  CBC.ACCOUNTS.forEach(a => {
+    known[a.iban] = true;
+    out[a.iban] = { csv: null, pdf: null, csvRank: -1, pdfRank: -1 };
+  });
+  CBC.CARD_ACCOUNTS.forEach(card => {
+    out.__cards[card.key] = { csv: null, csvRank: -1, csvs: [] };
+  });
 
-  const files = folder.getFiles();
-  while (files.hasNext()) {
-    const file = files.next();
+  parcourirFichiersDriveRecursif_(folder, file => {
     const name = file.getName();
-    if (!/\.csv$/i.test(name)) continue;
+    const extMatch = name.match(/\.(csv|pdf)$/i);
+    if (!extMatch) return;
 
-    const mIban = name.match(/export_(BE\d{14})/i);
-    if (!mIban) continue;
+    const ext = extMatch[1].toLowerCase();
+    const rank = getBankFileDate_(file).getTime();
+    const upperName = String(name || '').toUpperCase();
+
+    // Carte Mastercard Business Blue : pas d'IBAN dans le nom du fichier.
+    if (ext === 'csv') {
+      CBC.CARD_ACCOUNTS.forEach(card => {
+        if (upperName.indexOf(card.filenameContains) !== -1) {
+          const current = out.__cards[card.key];
+          current.csvs.push({ file: file, rank: rank });
+          if (!current.csv || rank > current.csvRank) {
+            current.csv = file;
+            current.csvRank = rank;
+          }
+        }
+      });
+    }
+
+    // Comptes bancaires CBC : recherche de l'IBAN connu dans le nom.
+    const compactName = upperName.replace(/\s+/g, '');
+    const mIban = compactName.match(/(BE\d{14})/);
+    if (!mIban) return;
     const iban = mIban[1].toUpperCase();
-    if (!known[iban]) continue;
+    if (!known[iban]) return;
 
-    const mDate = name.match(/_(\d{8})_(\d{4})/);
-    let rank;
-    if (mDate) {
-      const ds = mDate[1];
-      const ts = mDate[2];
-      rank = new Date(
-        Number(ds.slice(0, 4)), Number(ds.slice(4, 6)) - 1, Number(ds.slice(6, 8)),
-        Number(ts.slice(0, 2)), Number(ts.slice(2, 4)), 0
-      ).getTime();
-    } else {
-      rank = file.getLastUpdated().getTime();
+    if (ext === 'csv' && rank > out[iban].csvRank) {
+      out[iban].csv = file;
+      out[iban].csvRank = rank;
+    } else if (ext === 'pdf' && rank > out[iban].pdfRank) {
+      out[iban].pdf = file;
+      out[iban].pdfRank = rank;
+    }
+  });
+
+  CBC.CARD_ACCOUNTS.forEach(card => {
+    const current = out.__cards[card.key];
+    current.csvs.sort((a, b) => a.rank - b.rank);
+  });
+
+  return out;
+}
+
+/**
+ * Parcourt le dossier sélectionné ET tous ses sous-dossiers.
+ * Un parcours itératif est utilisé pour éviter une récursion JavaScript trop profonde.
+ */
+function parcourirFichiersDriveRecursif_(rootFolder, callback) {
+  if (!rootFolder) throw new Error('Dossier Drive invalide.');
+
+  const stack = [rootFolder];
+  const visited = {};
+  let foldersScanned = 0;
+
+  while (stack.length) {
+    const folder = stack.pop();
+    const folderId = folder.getId();
+    if (visited[folderId]) continue;
+    visited[folderId] = true;
+
+    foldersScanned++;
+    if (foldersScanned > CBC.MAX_SCAN_FOLDERS) {
+      throw new Error(
+        'Le dossier sélectionné contient trop de sous-dossiers à analyser (plus de ' +
+        CBC.MAX_SCAN_FOLDERS + '). Choisis un dossier CBC plus précis.'
+      );
     }
 
-    if (!selected[iban] || rank > ranks[iban]) {
-      selected[iban] = file;
-      ranks[iban] = rank;
-    }
+    const files = folder.getFiles();
+    while (files.hasNext()) callback(files.next(), folder);
+
+    if (!CBC.SCAN_SUBFOLDERS) continue;
+    const subfolders = folder.getFolders();
+    while (subfolders.hasNext()) stack.push(subfolders.next());
   }
+}
+
+function getLatestCsvFiles_(folder) {
+  const inventory = getLatestBankFiles_(folder);
+  const selected = {};
+  CBC.ACCOUNTS.forEach(a => {
+    if (inventory[a.iban] && inventory[a.iban].csv) selected[a.iban] = inventory[a.iban].csv;
+  });
   return selected;
+}
+
+function getBankFileDate_(file) {
+  const name = file.getName();
+  const m = name.match(/_(\d{8})_(\d{4})(?:\D|$)/);
+  if (m) {
+    const ds = m[1];
+    const ts = m[2];
+    const d = new Date(
+      Number(ds.slice(0, 4)), Number(ds.slice(4, 6)) - 1, Number(ds.slice(6, 8)),
+      Number(ts.slice(0, 2)), Number(ts.slice(2, 4)), 0
+    );
+    if (!isNaN(d.getTime())) return d;
+  }
+  return file.getLastUpdated();
+}
+
+function ageDays_(date, now) {
+  if (!(date instanceof Date) || isNaN(date.getTime())) return null;
+  const ref = now instanceof Date ? now : new Date();
+  return Math.max(0, Math.floor((ref.getTime() - date.getTime()) / 86400000));
 }
 
 function parseCbcCsv_(file, def) {
@@ -469,9 +731,12 @@ function parseCbcCsv_(file, def) {
     transactions.push(transaction);
   }
 
-  // Les exports CBC sont généralement du plus récent au plus ancien.
-  // On remet ici les opérations dans l'ordre chronologique du classeur Excel.
-  transactions.sort(comparerTransactions_);
+  // IMPORTANT : l'ordre comptable réel est celui du CSV CBC, qui est exporté
+  // du plus récent au plus ancien. On inverse donc l'ordre des lignes du CSV.
+  // La date d'opération ne doit PAS être prioritaire : une opération datée du
+  // lendemain peut appartenir au même extrait et avoir été comptabilisée avant
+  // des paiements portant une date antérieure.
+  transactions.sort(comparerOrdreCbc_);
 
   let currentExtract = null;
   let pos = 0;
@@ -577,6 +842,178 @@ function ecrireDiversBanque_(ss, transactions) {
   sheet.getRange(CBC.DATA_START_ROW, 11, values.length, 1).setNumberFormat('#,##0.00');
 }
 
+/**
+ * Corrige automatiquement, pour n'importe quel onglet bancaire CBC, le bloc récent
+ * qui présente une Vérification (colonne N) non nulle, à condition que toutes les
+ * lignes concernées soient retrouvées dans le dernier CSV du compte.
+ *
+ * Sécurité :
+ * - aucune correction si N est déjà correct ;
+ * - aucune correction si une ligne du bloc n'est pas retrouvée dans le CSV ;
+ * - aucune écriture tant que l'ordre CSV n'a pas reproduit exactement tous les soldes K.
+ */
+function corrigerOrdreRecentCompte_(sheet, transactions, def) {
+  if (!sheet || !transactions || !transactions.length) return { corrected: 0, firstBadRow: 0 };
+
+  const lastOp = derniereLigneOperation_(sheet);
+  if (lastOp < CBC.DATA_START_ROW) return { corrected: 0, firstBadRow: 0 };
+
+  const nValues = sheet.getRange(
+    CBC.DATA_START_ROW, 14,
+    lastOp - CBC.DATA_START_ROW + 1, 1
+  ).getValues();
+
+  let firstBadRow = 0;
+  for (let i = 0; i < nValues.length; i++) {
+    const n = convertirNombre_(nValues[i][0]);
+    if (n !== null && Math.abs(n) > 0.005) {
+      firstBadRow = CBC.DATA_START_ROW + i;
+      break;
+    }
+  }
+
+  // Pas d'écart réel : on met simplement les micro-écarts à zéro.
+  if (!firstBadRow) {
+    normaliserMicroEcartsVerification_(sheet);
+    return { corrected: 0, firstBadRow: 0 };
+  }
+
+  const count = lastOp - firstBadRow + 1;
+  const existing = sheet.getRange(firstBadRow, 1, count, CBC.DATA_WIDTH).getValues();
+
+  // Indexe chaque opération du dernier CSV. Les tableaux permettent de gérer les doublons.
+  const exactMap = new Map();
+  const stableMap = new Map();
+  transactions.forEach(t => {
+    const exact = construireCle_(t.date, t.extract, t.description, t.amount, t.balance);
+    const stable = construireCleStable_(t.date, t.extract, t.account, t.amount, t.balance);
+    if (!exactMap.has(exact)) exactMap.set(exact, []);
+    if (!stableMap.has(stable)) stableMap.set(stable, []);
+    exactMap.get(exact).push(t);
+    stableMap.get(stable).push(t);
+  });
+
+  const used = new Set();
+  function prendreTransaction_(map, key) {
+    const list = map.get(key) || [];
+    while (list.length) {
+      const t = list.shift();
+      if (!used.has(t)) {
+        used.add(t);
+        return t;
+      }
+    }
+    return null;
+  }
+
+  const matched = [];
+  for (let i = 0; i < existing.length; i++) {
+    const r = existing[i];
+    if (r[0] === '' || r[0] === null) continue;
+
+    const exact = construireCle_(r[0], r[1], r[5], r[8], r[10]);
+    const stable = construireCleStable_(r[0], r[1], r[2], r[8], r[10]);
+    let t = prendreTransaction_(exactMap, exact);
+    if (!t) t = prendreTransaction_(stableMap, stable);
+
+    if (!t) {
+      throw new Error(
+        'Correction automatique impossible pour ' + sheet.getName() + '.\n\n' +
+        'La ligne ' + (firstBadRow + i) + ' présente une vérification incorrecte, ' +
+        'mais elle n’a pas été retrouvée de façon sûre dans le dernier CSV.\n\n' +
+        'Aucune ligne de cet onglet n’a été réordonnée. Mets un CSV suffisamment complet puis relance la mise à jour.'
+      );
+    }
+    matched.push(t);
+  }
+
+  if (!matched.length) return { corrected: 0, firstBadRow: firstBadRow };
+  matched.sort(comparerOrdreCbc_);
+
+  // Solde de départ : solde CBC de la ligne juste avant le bloc fautif.
+  let previousBalance;
+  if (firstBadRow > CBC.DATA_START_ROW) {
+    previousBalance = convertirNombre_(sheet.getRange(firstBadRow - 1, 11).getValue());
+  }
+  if (previousBalance === null || previousBalance === undefined) {
+    previousBalance = arrondir2_(matched[0].balance - matched[0].amount);
+  } else {
+    previousBalance = arrondir2_(previousBalance);
+  }
+
+  // Valide TOUT le bloc avant toute écriture.
+  let check = previousBalance;
+  for (let i = 0; i < matched.length; i++) {
+    const t = matched[i];
+    const expected = arrondir2_(check + t.amount);
+    const diff = arrondir2_(t.balance - expected);
+    if (Math.abs(diff) > 0.005) {
+      throw new Error(
+        'Correction automatique annulée pour ' + sheet.getName() + '.\n\n' +
+        'L’ordre du CSV ne reproduit pas le solde CBC à la ligne CSV ' + (t.sourceCsvLine || '?') + '.\n' +
+        'Montant : ' + t.amount.toFixed(2) + ' €\n' +
+        'Solde attendu : ' + expected.toFixed(2) + ' €\n' +
+        'Solde CBC : ' + t.balance.toFixed(2) + ' €\n' +
+        'Écart : ' + diff.toFixed(2) + ' €\n\n' +
+        'Aucune ligne n’a été réordonnée.'
+      );
+    }
+    check = expected;
+  }
+
+  // Une sauvegarde quotidienne existe avant toute correction réelle, y compris en auto.
+  creerSauvegardeQuotidienne_();
+
+  const rows = [];
+  let cumulative = previousBalance;
+  matched.forEach(t => {
+    cumulative = arrondir2_(cumulative + t.amount);
+    rows.push([
+      t.date, t.extract, t.account, t.counterpartyAccount, t.counterpartyName,
+      t.description, t.communication, '', t.amount, '', t.balance, '', cumulative, 0
+    ]);
+  });
+
+  sheet.getRange(firstBadRow, 1, rows.length, CBC.DATA_WIDTH).setValues(rows);
+  sheet.getRange(firstBadRow, 1, rows.length, 1).setNumberFormat('dd/MM/yyyy');
+  [9, 11, 13, 14].forEach(col =>
+    sheet.getRange(firstBadRow, col, rows.length, 1).setNumberFormat('#,##0.00')
+  );
+
+  normaliserMicroEcartsVerification_(sheet);
+  ecrireTotal_(sheet, def);
+
+  return { corrected: rows.length, firstBadRow: firstBadRow };
+}
+
+/** Remplace uniquement les micro-écarts de N (<= 0,005 €) par un vrai zéro. */
+function normaliserMicroEcartsVerification_(sheet) {
+  if (!sheet) return 0;
+  const lastOp = derniereLigneOperation_(sheet);
+  if (lastOp < CBC.DATA_START_ROW) return 0;
+
+  const values = sheet.getRange(
+    CBC.DATA_START_ROW, 14,
+    lastOp - CBC.DATA_START_ROW + 1, 1
+  ).getValues();
+
+  const cells = [];
+  for (let i = 0; i < values.length; i++) {
+    const n = convertirNombre_(values[i][0]);
+    if (n !== null && n !== 0 && Math.abs(n) <= 0.005) {
+      cells.push('N' + (CBC.DATA_START_ROW + i));
+    }
+  }
+
+  // RangeList permet de ne toucher qu'aux cellules à corriger et conserve les
+  // autres formules/valeurs de la colonne N. On travaille par paquets pour les gros onglets.
+  const batchSize = 500;
+  for (let i = 0; i < cells.length; i += batchSize) {
+    sheet.getRangeList(cells.slice(i, i + batchSize)).setValue(0);
+  }
+  return cells.length;
+}
+
 function ajouterNouvellesOperations_(sheet, transactions, def) {
   if (!transactions.length) {
     ecrireTotal_(sheet, def);
@@ -611,7 +1048,7 @@ function ajouterNouvellesOperations_(sheet, transactions, def) {
     }
   });
 
-  toAdd.sort(comparerTransactions_);
+  toAdd.sort(comparerOrdreCbc_);
   const oldTotalRow = trouverLigneTotal_(sheet);
   if (oldTotalRow) sheet.getRange(oldTotalRow, 8, 1, 7).clearContent(); // H:N
 
@@ -634,17 +1071,56 @@ function ajouterNouvellesOperations_(sheet, transactions, def) {
     }
   }
 
+  // Le solde CBC (colonne K) est la référence absolue pour démarrer le nouveau bloc.
+  // On ne repart plus prioritairement de M afin d'éviter qu'un ancien micro-écart
+  // d'arrondi se propage dans les nouvelles lignes.
   let previousCumulative = 0;
   if (lastOp >= CBC.DATA_START_ROW) {
-    const m = convertirNombre_(sheet.getRange(lastOp, 13).getValue());
     const k = convertirNombre_(sheet.getRange(lastOp, 11).getValue());
-    previousCumulative = m !== null ? m : (k !== null ? k : 0);
+    const m = convertirNombre_(sheet.getRange(lastOp, 13).getValue());
+    previousCumulative = k !== null ? arrondir2_(k) : (m !== null ? arrondir2_(m) : 0);
+  }
+
+  // Contrôle de sécurité AVANT écriture : l'ordre physique du CSV doit reproduire
+  // exactement les soldes CBC. Si ce n'est pas le cas, on annule l'import au lieu
+  // d'écrire des lignes avec une Vérification (N) non nulle.
+  let checkBalance = previousCumulative;
+  const orderErrors = [];
+  toAdd.forEach((t, index) => {
+    const expected = arrondir2_(checkBalance + t.amount);
+    const diff = arrondir2_(t.balance - expected);
+    if (Math.abs(diff) > 0.005) {
+      orderErrors.push({
+        index: index + 1,
+        csvLine: t.sourceCsvLine || '',
+        extract: t.extract || '',
+        amount: t.amount,
+        expected: expected,
+        balance: t.balance,
+        diff: diff
+      });
+    }
+    checkBalance = expected;
+  });
+
+  if (orderErrors.length) {
+    const e = orderErrors[0];
+    throw new Error(
+      'Import annulé pour ' + sheet.getName() + ' : l’ordre des opérations ne permet pas de retrouver le solde CBC.\n\n' +
+      'Première anomalie : opération n° ' + e.index +
+      (e.csvLine ? ' (ligne CSV ' + e.csvLine + ')' : '') +
+      ', extrait ' + e.extract +
+      ', montant ' + e.amount.toFixed(2) + ' €, solde attendu ' + e.expected.toFixed(2) +
+      ' €, solde CBC ' + e.balance.toFixed(2) + ' €, écart ' + e.diff.toFixed(2) + ' €.\n\n' +
+      'Aucune nouvelle ligne n’a été écrite. Vérifie que le CSV sélectionné est bien le plus récent et complet.'
+    );
   }
 
   const rows = [];
   toAdd.forEach(t => {
     previousCumulative = arrondir2_(previousCumulative + t.amount);
-    const verification = arrondir2_(t.balance - previousCumulative);
+    const rawVerification = arrondir2_(t.balance - previousCumulative);
+    const verification = Math.abs(rawVerification) <= 0.005 ? 0 : rawVerification;
     rows.push([
       t.date, t.extract, t.account, t.counterpartyAccount, t.counterpartyName,
       t.description, t.communication, '', t.amount, '', t.balance, '',
@@ -817,6 +1293,29 @@ function construireCleStable_(date, extract, account, amount, balance) {
   ].join('|');
 }
 
+/**
+ * Ordre comptable réel d'un export CBC.
+ *
+ * Les exports CBC utilisés par ce classeur sont fournis du plus récent au plus
+ * ancien. La ligne CSV la plus basse est donc l'opération la plus ancienne.
+ * On utilise d'abord sourceCsvLine (ordre physique du fichier), car la date
+ * d'opération peut être différente de l'ordre de comptabilisation bancaire.
+ */
+function comparerOrdreCbc_(a, b) {
+  const la = Number(a && a.sourceCsvLine) || 0;
+  const lb = Number(b && b.sourceCsvLine) || 0;
+  if (la && lb && la !== lb) return lb - la; // ligne la plus basse du CSV en premier
+
+  // Secours si la provenance CSV n'est pas disponible.
+  const ea = Number(String((a && a.extract) || '').replace(/\D/g, '')) || 0;
+  const eb = Number(String((b && b.extract) || '').replace(/\D/g, '')) || 0;
+  if (ea !== eb) return ea - eb;
+
+  const da = a && a.date instanceof Date ? a.date.getTime() : 0;
+  const db = b && b.date instanceof Date ? b.date.getTime() : 0;
+  return da - db;
+}
+
 function comparerTransactions_(a, b) {
   const da = a.date instanceof Date ? a.date.getTime() : 0;
   const db = b.date instanceof Date ? b.date.getTime() : 0;
@@ -831,6 +1330,17 @@ function comparerTransactions_(a, b) {
   return (b.sourceCsvLine || 0) - (a.sourceCsvLine || 0);
 }
 
+
+/** Corrige le fuseau du classeur afin que les dates CBC soient interprétées en Belgique. */
+function corrigerFuseauHoraireCBC_(ss) {
+  if (!ss) return;
+  try {
+    const current = ss.getSpreadsheetTimeZone();
+    if (current !== CBC.TIMEZONE) ss.setSpreadsheetTimeZone(CBC.TIMEZONE);
+  } catch (e) {
+    console.warn('Impossible de corriger le fuseau horaire du classeur : ' + e.message);
+  }
+}
 
 function getSpreadsheet_() {
   const active = SpreadsheetApp.getActiveSpreadsheet();
@@ -865,8 +1375,218 @@ function extraireIdDrive_(text) {
   return m ? m[1] : '';
 }
 
+
+/** Crée automatiquement l'onglet VISA-CBC s'il n'existe pas. */
+function assurerOngletVisaCbc_(ss) {
+  const name = CBC.CARD_ACCOUNTS[0].sheet;
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  if (sheet.getMaxColumns() < 16) sheet.insertColumnsAfter(sheet.getMaxColumns(), 16 - sheet.getMaxColumns());
+  if (sheet.getMaxRows() < 1000) sheet.insertRowsAfter(sheet.getMaxRows(), 1000 - sheet.getMaxRows());
+
+  const headers = [[
+    'Carte', 'Titulaire', 'État de dépenses', 'Date opération', 'Date règlement',
+    'Montant', 'Crédit', 'Débit', 'Devise', 'Cours', 'Montant EUR', 'Frais opération',
+    'Commerçant', 'Emplacement', 'Pays', 'Commentaire'
+  ]];
+  sheet.getRange(1, 1, 1, 16).setValues(headers).setFontWeight('bold');
+  sheet.setFrozenRows(1);
+  sheet.getRange('D:E').setNumberFormat('dd/MM/yyyy');
+  sheet.getRange('F:L').setNumberFormat('#,##0.00');
+  return sheet;
+}
+
+function parseMastercardBusinessCsv_(file) {
+  const blob = file.getBlob();
+  let text = blob.getDataAsString('UTF-8');
+  if (text.indexOf('\uFFFD') !== -1) text = blob.getDataAsString('windows-1252');
+  text = text.replace(/^\uFEFF/, '');
+
+  let rows = Utilities.parseCsv(text, ';');
+  rows = rows.filter(row => row.some(v => String(v || '').trim() !== ''));
+  if (rows.length < 2) return [];
+
+  const h = rows[0].map(normaliserEntete_);
+  function col(name) {
+    const n = normaliserEntete_(name);
+    const i = h.indexOf(n);
+    if (i < 0) throw new Error('CSV Mastercard : colonne manquante « ' + name + ' ».');
+    return i;
+  }
+
+  const m = {
+    card: col('carte de crédit'), holder: col('titulaire de carte'), statement: col('Etat de dépenses'),
+    operationDate: col("date de l'opération"), settlementDate: col('Date du règlement'),
+    amount: col('montant'), credit: col('crédit'), debit: col('débit'), currency: col('devise'),
+    rate: col('cours'), amountEur: col('montant en EUR'), fee: col('Frais sur opération'),
+    merchant: col('Commerçant'), location: col('emplacement'), country: col('pays'), comment: col('commentaire')
+  };
+
+  const out = [];
+  for (let i = 1; i < rows.length; i++) {
+    const r = rows[i];
+    const opDate = convertirDate_(cell_(r, m.operationDate));
+    const setDate = convertirDate_(cell_(r, m.settlementDate));
+    const amountEur = convertirNombre_(cell_(r, m.amountEur));
+    if (!opDate && !setDate && amountEur === null) continue;
+
+    out.push({
+      card: nettoyerTexte_(cell_(r, m.card)),
+      holder: nettoyerTexte_(cell_(r, m.holder)),
+      statement: nettoyerTexte_(cell_(r, m.statement)),
+      operationDate: opDate,
+      settlementDate: setDate,
+      amount: convertirNombre_(cell_(r, m.amount)),
+      credit: convertirNombre_(cell_(r, m.credit)),
+      debit: convertirNombre_(cell_(r, m.debit)),
+      currency: nettoyerTexte_(cell_(r, m.currency)),
+      rate: convertirNombre_(cell_(r, m.rate)),
+      amountEur: amountEur,
+      fee: convertirNombre_(cell_(r, m.fee)),
+      merchant: nettoyerTexte_(cell_(r, m.merchant)),
+      location: nettoyerTexte_(cell_(r, m.location)),
+      country: nettoyerTexte_(cell_(r, m.country)),
+      comment: nettoyerTexte_(cell_(r, m.comment)),
+      sourceCsvLine: i + 1,
+      sourceFile: file.getName()
+    });
+  }
+  return out;
+}
+
+function cleVisaCbc_(t) {
+  return [
+    nettoyerPourCle_(t.card), nettoyerPourCle_(t.holder), nettoyerPourCle_(t.statement),
+    cleDate_(t.operationDate), cleDate_(t.settlementDate), cents_(t.amount), cents_(t.credit),
+    cents_(t.debit), nettoyerPourCle_(t.currency), cents_(t.rate), cents_(t.amountEur), cents_(t.fee),
+    nettoyerPourCle_(t.merchant), nettoyerPourCle_(t.location), nettoyerPourCle_(t.country), nettoyerPourCle_(t.comment)
+  ].join('|');
+}
+
+function ligneVersVisaCbc_(r) {
+  return {
+    card: nettoyerTexte_(r[0]), holder: nettoyerTexte_(r[1]), statement: nettoyerTexte_(r[2]),
+    operationDate: convertirDate_(r[3]), settlementDate: convertirDate_(r[4]),
+    amount: convertirNombre_(r[5]), credit: convertirNombre_(r[6]), debit: convertirNombre_(r[7]),
+    currency: nettoyerTexte_(r[8]), rate: convertirNombre_(r[9]), amountEur: convertirNombre_(r[10]),
+    fee: convertirNombre_(r[11]), merchant: nettoyerTexte_(r[12]), location: nettoyerTexte_(r[13]),
+    country: nettoyerTexte_(r[14]), comment: nettoyerTexte_(r[15]), sourceCsvLine: 0
+  };
+}
+
+function comparerVisaCbc_(a, b) {
+  const sa = a.settlementDate instanceof Date ? a.settlementDate.getTime() : 0;
+  const sb = b.settlementDate instanceof Date ? b.settlementDate.getTime() : 0;
+  if (sa !== sb) return sa - sb;
+  const oa = a.operationDate instanceof Date ? a.operationDate.getTime() : 0;
+  const ob = b.operationDate instanceof Date ? b.operationDate.getTime() : 0;
+  if (oa !== ob) return oa - ob;
+  // Le CSV est du plus récent au plus ancien : à date égale, ligne CSV la plus basse d'abord.
+  return (Number(b.sourceCsvLine) || 0) - (Number(a.sourceCsvLine) || 0);
+}
+
+/**
+ * Fusionne plusieurs exports Mastercard qui peuvent se chevaucher.
+ * Pour une opération donnée, on conserve le nombre maximal d'occurrences observé
+ * dans un même fichier : ainsi deux exports couvrant la même période ne créent
+ * pas de doublons, tout en conservant les vrais achats identiques répétés.
+ */
+function fusionnerTransactionsVisaFichiers_(lists) {
+  const best = new Map();
+
+  (lists || []).forEach(list => {
+    const counts = new Map();
+    const samples = new Map();
+
+    (list || []).forEach(t => {
+      const k = cleVisaCbc_(t);
+      counts.set(k, (counts.get(k) || 0) + 1);
+      if (!samples.has(k)) samples.set(k, []);
+      samples.get(k).push(t);
+    });
+
+    counts.forEach((count, k) => {
+      const current = best.get(k);
+      // À égalité, on préfère le dernier fichier parcouru (généralement le plus récent)
+      // pour conserver ses informations de ligne/source.
+      if (!current || count >= current.count) {
+        best.set(k, { count: count, samples: samples.get(k) || [] });
+      }
+    });
+  });
+
+  const out = [];
+  best.forEach(item => {
+    for (let i = 0; i < item.count; i++) {
+      out.push(item.samples[Math.min(i, item.samples.length - 1)]);
+    }
+  });
+
+  out.sort(comparerVisaCbc_);
+  return out;
+}
+
+function mettreAJourVisaCbc_(ss, transactions) {
+  const sheet = assurerOngletVisaCbc_(ss);
+  const last = sheet.getLastRow();
+  const existing = [];
+
+  if (last >= 2) {
+    const rows = sheet.getRange(2, 1, last - 1, 16).getValues();
+    rows.forEach(r => {
+      // Ignore la ligne TOTAL et les lignes vides.
+      if (String(r[9] || '').trim().toUpperCase() === 'TOTAL') return;
+      if (r.every(v => v === '' || v === null)) return;
+      if (!r[3] && !r[4] && r[10] === '') return;
+      existing.push(ligneVersVisaCbc_(r));
+    });
+  }
+
+  // Multiensemble : préserve les vraies opérations identiques apparaissant plusieurs fois.
+  const counts = new Map();
+  existing.forEach(t => counts.set(cleVisaCbc_(t), (counts.get(cleVisaCbc_(t)) || 0) + 1));
+
+  const missing = [];
+  const available = new Map(counts);
+  transactions.forEach(t => {
+    const k = cleVisaCbc_(t);
+    const n = available.get(k) || 0;
+    if (n > 0) available.set(k, n - 1);
+    else missing.push(t);
+  });
+
+  const combined = existing.concat(missing);
+  combined.sort(comparerVisaCbc_);
+
+  const clearRows = Math.max(last, combined.length + 3);
+  if (clearRows >= 2) sheet.getRange(2, 1, clearRows - 1, 16).clearContent();
+  assurerNombreLignes_(sheet, combined.length + 4);
+
+  if (combined.length) {
+    const values = combined.map(t => [
+      t.card, t.holder, t.statement, t.operationDate || '', t.settlementDate || '',
+      t.amount === null ? '' : t.amount, t.credit === null ? '' : t.credit, t.debit === null ? '' : t.debit,
+      t.currency, t.rate === null ? '' : t.rate, t.amountEur === null ? '' : t.amountEur,
+      t.fee === null ? '' : t.fee, t.merchant, t.location, t.country, t.comment
+    ]);
+    sheet.getRange(2, 1, values.length, 16).setValues(values);
+    sheet.getRange(2, 4, values.length, 2).setNumberFormat('dd/MM/yyyy');
+    sheet.getRange(2, 6, values.length, 7).setNumberFormat('#,##0.00');
+  }
+
+  const totalRow = combined.length + 3;
+  sheet.getRange(totalRow, 10).setValue('TOTAL').setFontWeight('bold');
+  sheet.getRange(totalRow, 11)
+    .setFormula(combined.length ? '=SUM(K2:K' + (combined.length + 1) + ')' : '=0')
+    .setFontWeight('bold').setNumberFormat('#,##0.00');
+
+  return { added: missing.length, total: combined.length };
+}
+
 function verifierOngletsRequis_(ss) {
-  const required = [CBC.DIVERS_SHEET, CBC.TOTAUX_SHEET].concat(CBC.ACCOUNTS.map(a => a.sheet));
+  const required = [CBC.DIVERS_SHEET, CBC.TOTAUX_SHEET]
+    .concat(CBC.ACCOUNTS.map(a => a.sheet))
+    .concat(CBC.CARD_ACCOUNTS.map(a => a.sheet));
   const missing = required.filter(name => !ss.getSheetByName(name));
   if (missing.length) throw new Error('Onglet(s) manquant(s) dans le Google Sheet : ' + missing.join(', '));
 }
@@ -883,6 +1603,18 @@ function ecrireJournal_(ss, rows) {
   }
   sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, 7).setValues(rows);
   sheet.getRange(2, 1, Math.max(1, sheet.getLastRow() - 1), 1).setNumberFormat('dd/MM/yyyy HH:mm:ss');
+}
+
+function journaliserErreurAuto_(message) {
+  try {
+    const ss = getSpreadsheet_();
+    ecrireJournal_(ss, [[
+      new Date(), '', '', '', 0, 0,
+      'ERREUR AUTO — ' + String(message || '').replace(/[\r\n]+/g, ' ').slice(0, 500)
+    ]]);
+  } catch (journalError) {
+    console.error('Impossible d’écrire l’erreur auto dans CBC-JOURNAL : ' + journalError);
+  }
 }
 
 function creerSauvegardeCBC() {
@@ -3140,3 +3872,720 @@ function valeurRecherche_(value) {
   if (value instanceof Date) return Utilities.formatDate(value, CBC.TIMEZONE, 'dd/MM/yyyy');
   return String(value).trim();
 }
+/* ============================================================================
+ * CONTROLE FACTURES PDF AMAZON — v2.2.3 AMAZON / RECAP FIX
+ * - Le dossier est choisi dans une fenêtre Google Drive (aucun ID codé en dur).
+ * - Tous les PDF du dossier et de ses sous-dossiers sont analysés.
+ * - Le nom du PDF n'est jamais utilisé comme preuve : le contenu du PDF fait foi.
+ * - Gère les PDF Amazon contenant plusieurs factures / vendeurs.
+ * - Gère aussi des factures Marketplace externes (FR/EN/DE) lorsqu'un n° de
+ *   commande Amazon et un total peuvent être lus.
+ * - Le traitement se fait par lots avec reprise automatique.
+ * ========================================================================== */
+
+const AMAZON_PDF = Object.freeze({
+  PROP_STATE: 'CBC_AMAZON_PDF_STATE',
+  PROP_LAST_FOLDER_ID: 'CBC_AMAZON_PDF_LAST_FOLDER_ID',
+  QUEUE_SHEET: '_AMZ_PDF_QUEUE',
+  DATA_SHEET: '_AMZ_PDF_DATA',
+  RESULT_SHEET: 'CONTROLE-FACTURES-PDF',
+  ERROR_SHEET: 'FACTURES-PDF-ERREURS',
+  TRIGGER_HANDLER: 'amazonContinuerControleFacturesPdf',
+  BATCH_MAX_MS: 90000,
+  MAX_FILES_PER_BATCH: 4,
+  TRIGGER_DELAY_MS: 15000
+});
+
+function amazonOuvrirControleFacturesPdf() {
+  const html = HtmlService.createHtmlOutput(`
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    *{box-sizing:border-box}body{font-family:Arial,sans-serif;margin:0;color:#202124;background:#fff}
+    .wrap{padding:16px}h2{margin:0 0 5px;font-size:19px}.hint{font-size:12px;color:#5f6368;margin-bottom:12px}
+    .layout{display:grid;grid-template-columns:1.35fr .85fr;gap:14px}.card{border:1px solid #dadce0;border-radius:10px;padding:12px}
+    .toolbar{display:flex;gap:7px;align-items:center;margin-bottom:8px}button{border:1px solid #dadce0;border-radius:6px;background:#fff;padding:7px 10px;cursor:pointer}
+    button:hover{background:#f8f9fa}.primary{background:#1a73e8;color:#fff;border-color:#1a73e8;font-weight:600}.path{font-size:12px;color:#5f6368;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+    .list{border:1px solid #e0e0e0;border-radius:7px;min-height:350px;max-height:410px;overflow:auto}.row{display:flex;align-items:center;gap:8px;padding:9px;border-bottom:1px solid #f1f3f4;cursor:pointer}
+    .row:hover{background:#f8f9fa}.name{flex:1;font-size:13px}.empty{padding:18px;color:#777;text-align:center}.field{margin:9px 0}.field label{display:block;font-size:12px;font-weight:600;margin-bottom:4px}
+    .sheets{max-height:235px;overflow:auto;border:1px solid #eee;border-radius:6px;padding:6px}.chk{display:block;font-size:12px;padding:4px 2px}.status{font-size:12px;margin-top:9px;white-space:pre-wrap;color:#3c4043}
+    .actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}.info{background:#e8f0fe;color:#174ea6;border-radius:8px;padding:9px;font-size:12px;line-height:1.45}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h2>Contrôle des factures PDF</h2>
+  <div class="hint">Choisis simplement le dossier contenant les factures. Les sous-dossiers seront analysés automatiquement.</div>
+  <div class="layout">
+    <div class="card">
+      <div class="toolbar"><button id="back" onclick="goBack()">← Retour</button><div id="path" class="path">Google Drive</div><button onclick="loadFolder(currentId)">↻</button></div>
+      <div id="list" class="list"><div class="empty">Chargement…</div></div>
+      <div class="status" id="selectedFolder">Dossier actuel : Google Drive</div>
+    </div>
+    <div class="card">
+      <div class="info"><b>Important :</b> le script lit le contenu réel des PDF. Il ne se fie pas au nom du fichier. Il détecte aussi plusieurs factures dans un même PDF et les paiements groupés par référence Amazon.</div>
+      <div class="field"><label>Onglets bancaires CBC à contrôler</label><div id="sheets" class="sheets"></div></div>
+      <div class="status" id="status">Sélectionne le dossier voulu à gauche, puis lance l'analyse.</div>
+      <div class="actions"><button onclick="google.script.host.close()">Annuler</button><button class="primary" id="run" onclick="runCheck()">Analyser ce dossier</button></div>
+    </div>
+  </div>
+</div>
+<script>
+let currentId='ROOT', parentId=null;
+function init(){
+  google.script.run.withSuccessHandler(cfg=>{
+    const box=document.getElementById('sheets'); box.innerHTML='';
+    (cfg.bankSheets||[]).forEach(n=>{const lab=document.createElement('label');lab.className='chk';lab.innerHTML='<input type="checkbox" checked value="'+esc(n)+'"> '+esc(n);box.appendChild(lab);});
+    loadFolder(cfg.lastFolderId||'ROOT');
+  }).withFailureHandler(showErr).amazonGetConfig();
+}
+function loadFolder(id){
+  currentId=id||'ROOT';document.getElementById('list').innerHTML='<div class="empty">Chargement…</div>';
+  google.script.run.withSuccessHandler(renderFolder).withFailureHandler(showErr).cbcListerDossiersDrive(currentId);
+}
+function renderFolder(d){
+  currentId=d.id;parentId=d.parentId||null;document.getElementById('path').textContent=d.name||'Google Drive';document.getElementById('selectedFolder').innerHTML='Dossier sélectionné : <b>'+esc(d.name||'Google Drive')+'</b> — sous-dossiers inclus';
+  document.getElementById('back').disabled=!parentId;
+  const list=document.getElementById('list');list.innerHTML='';
+  (d.folders||[]).forEach(f=>{const r=document.createElement('div');r.className='row';r.innerHTML='<span>📁</span><div class="name">'+esc(f.name)+'</div><span>›</span>';r.onclick=()=>loadFolder(f.id);list.appendChild(r);});
+  if(!(d.folders||[]).length)list.innerHTML='<div class="empty">Aucun sous-dossier. Tu peux analyser ce dossier.</div>';
+}
+function goBack(){if(parentId)loadFolder(parentId);}
+let pollTimer=null,lastProcessed=-1,lastProgressAt=0,recoveryRunning=false;
+function runCheck(){
+  const sheets=[...document.querySelectorAll('#sheets input:checked')].map(x=>x.value);if(!sheets.length){alert('Sélectionne au moins un onglet bancaire.');return;}
+  const b=document.getElementById('run');b.disabled=true;b.textContent='Préparation…';document.getElementById('status').textContent='Préparation de la liste des PDF…';
+  google.script.run.withSuccessHandler(r=>{
+      document.getElementById('status').textContent='Analyse lancée : '+r.pdfCount+' PDF trouvé(s).\\nDossier : '+r.folderName+'\\nDémarrage immédiat du premier lot…';
+      b.textContent='Analyse en cours…';
+      lastProcessed=0;lastProgressAt=Date.now();
+      lancerPremierLot();
+    })
+    .withFailureHandler(e=>{showErr(e);b.disabled=false;b.textContent='Analyser ce dossier';}).amazonDemarrerControleFacturesPdf(currentId,sheets);
+}
+function lancerPremierLot(){
+  google.script.run.withSuccessHandler(st=>{
+      renderState(st);
+      demarrerPolling();
+    }).withFailureHandler(e=>{showErr(e);demarrerPolling();}).amazonContinuerControleFacturesPdf();
+}
+function demarrerPolling(){
+  if(pollTimer)clearTimeout(pollTimer);
+  pollTimer=setTimeout(refreshState,2500);
+}
+function refreshState(){
+  google.script.run.withSuccessHandler(st=>{
+    renderState(st);
+    if(st && st.status!=='TERMINE' && st.status!=='ERREUR' && st.status!=='ARRETE'){
+      const p=Number(st.processed||0);
+      if(p!==lastProcessed){lastProcessed=p;lastProgressAt=Date.now();recoveryRunning=false;}
+      if(!recoveryRunning && Date.now()-lastProgressAt>35000){
+        recoveryRunning=true;lastProgressAt=Date.now();
+        document.getElementById('status').textContent += '\\nReprise automatique du traitement…';
+        google.script.run.withSuccessHandler(x=>{recoveryRunning=false;renderState(x);demarrerPolling();})
+          .withFailureHandler(e=>{recoveryRunning=false;showErr(e);demarrerPolling();}).amazonContinuerControleFacturesPdf();
+        return;
+      }
+      demarrerPolling();
+    }
+  }).withFailureHandler(e=>{showErr(e);demarrerPolling();}).amazonGetEtatControlePdf();
+}
+function renderState(st){
+  if(!st)return;
+  let txt='Statut : '+(st.status||'')+' | Phase : '+(st.phase||'')+'\\nPDF traités : '+(st.processed||0)+' / '+(st.queued||0)+'\\nFactures détectées : '+(st.invoices||0)+' | Erreurs PDF : '+(st.errors||0);
+  if(st.lastError)txt+='\\nErreur : '+st.lastError;
+  if(st.status==='TERMINE')txt+='\\n\\n✅ Contrôle terminé. Consulte l’onglet CONTROLE-FACTURES-PDF.';
+  document.getElementById('status').textContent=txt;
+  const b=document.getElementById('run');
+  if(st.status==='TERMINE'||st.status==='ERREUR'||st.status==='ARRETE'){b.disabled=false;b.textContent='Relancer l’analyse';}
+}
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function showErr(e){document.getElementById('status').textContent='Erreur : '+(e&&e.message?e.message:e);}
+init();
+</script>
+</body></html>`).setWidth(940).setHeight(660);
+  SpreadsheetApp.getUi().showModalDialog(html, 'CBC — Contrôle factures PDF');
+}
+
+function amazonGetConfig() {
+  const props = PropertiesService.getDocumentProperties();
+  let lastFolderId = props.getProperty(AMAZON_PDF.PROP_LAST_FOLDER_ID) || 'ROOT';
+  if (lastFolderId !== 'ROOT') {
+    try { DriveApp.getFolderById(lastFolderId).getName(); } catch (e) { lastFolderId = 'ROOT'; }
+  }
+  return { bankSheets: CBC.ACCOUNTS.map(a => a.sheet), lastFolderId: lastFolderId };
+}
+
+function amazonDemarrerControleFacturesPdf(folderId, sheetNames) {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(15000)) throw new Error('Un autre traitement CBC est en cours. Réessaie dans quelques instants.');
+  try {
+    const root = DriveApp.getRootFolder();
+    const folder = (!folderId || folderId === 'ROOT') ? root : DriveApp.getFolderById(folderId);
+    const allowed = new Set(CBC.ACCOUNTS.map(a => a.sheet));
+    let selected = Array.isArray(sheetNames) ? sheetNames.filter(n => allowed.has(n)) : [];
+    if (!selected.length) selected = CBC.ACCOUNTS.map(a => a.sheet);
+
+    PropertiesService.getDocumentProperties().setProperty(AMAZON_PDF.PROP_LAST_FOLDER_ID, folder.getId());
+    amazonSupprimerTriggers_();
+
+    const ss = getSpreadsheet_();
+    const queue = amazonCollecterPdfs_(folder, folder.getName() || 'Mon Drive');
+    if (!queue.length) throw new Error('Aucun fichier PDF trouvé dans ce dossier ni dans ses sous-dossiers.');
+
+    const qsh = amazonPrepareSheet_(ss, AMAZON_PDF.QUEUE_SHEET, ['FileId','Fichier','Chemin','Statut','Nb factures','Erreur'], true);
+    assurerNombreLignes_(qsh, Math.max(100, queue.length + 5));
+    qsh.getRange(2,1,queue.length,6).setValues(queue.map(x => [x.id,x.name,x.path,'EN ATTENTE','', '']));
+
+    amazonPrepareSheet_(ss, AMAZON_PDF.DATA_SHEET, ['FileId','Fichier','Chemin','Index','Type PDF','Fournisseur','Société facturée','TVA client','N° facture','N° commande Amazon','Référence paiement','Date facture','Montant','Devise','Commande nom fichier','Nom cohérent','Texte clé'], true);
+    amazonPrepareSheet_(ss, AMAZON_PDF.ERROR_SHEET, ['Fichier','Chemin','Erreur','Lien PDF'], false);
+    amazonPrepareSheet_(ss, AMAZON_PDF.RESULT_SHEET, [], false);
+
+    const state = {
+      status: 'ACTIF', phase: 'SCAN', folderId: folder.getId(), folderName: folder.getName() || 'Mon Drive',
+      bankSheets: selected, queued: queue.length, processed: 0, errors: 0, invoices: 0,
+      startedAt: new Date().toISOString(), updatedAt: new Date().toISOString(), lastError: ''
+    };
+    amazonSaveState_(state);
+    amazonMettreAJourProgress_(ss, state, 'Préparation terminée. Démarrage de la lecture des PDF…');
+    try { amazonProgrammerSuite_(15000); } catch (e) {
+      state.lastError = 'Déclencheur automatique indisponible : le traitement continuera depuis la fenêtre ouverte. ' + String(e && e.message ? e.message : e);
+      amazonSaveState_(state);
+      amazonMettreAJourProgress_(ss, state, state.lastError);
+    }
+    return { ok:true, pdfCount:queue.length, folderName:state.folderName, bankSheets:selected };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function amazonCollecterPdfs_(startFolder, startPath) {
+  const out = [];
+  const stack = [{folder:startFolder, path:startPath}];
+  let safetyFolders = 0;
+  while (stack.length) {
+    const item = stack.pop();
+    safetyFolders++;
+    if (safetyFolders > 10000) throw new Error('Trop de sous-dossiers à parcourir (limite de sécurité atteinte).');
+    const files = item.folder.getFiles();
+    while (files.hasNext()) {
+      const f = files.next();
+      const fileName = String(f.getName() || '');
+      const isPdf = fileName.toLowerCase().endsWith('.pdf') || f.getMimeType() === 'application/pdf';
+      if (isPdf) {
+        // Les fichiers RECAPITULATIF Amazon ne sont pas des factures et ne doivent
+        // surtout pas être comptés comme erreurs de lecture.
+        if (amazonEstRecapitulatif_(fileName)) continue;
+        out.push({id:f.getId(), name:fileName, path:item.path});
+      }
+    }
+    const folders = item.folder.getFolders();
+    while (folders.hasNext()) {
+      const sf = folders.next();
+      stack.push({folder:sf, path:item.path + ' / ' + sf.getName()});
+    }
+  }
+  out.sort((a,b) => (a.path + '/' + a.name).localeCompare(b.path + '/' + b.name, 'fr', {sensitivity:'base'}));
+  return out;
+}
+
+function amazonEstRecapitulatif_(fileName) {
+  const n = normaliserRecherche_(String(fileName || ''));
+  return /(?:^|[_\s-])recapitulatif(?:[_\s.-]|$)/i.test(n) ||
+         /(?:^|[_\s-])recap(?:[_\s.-]|$)/i.test(n) ||
+         /order[ _-]?summary/i.test(n) ||
+         /resume[ _-]?(?:commande|order)/i.test(n);
+}
+
+function amazonContinuerControleFacturesPdf() {
+  const lock = LockService.getDocumentLock();
+  if (!lock.tryLock(15000)) return amazonGetEtatControlePdf();
+  try {
+    amazonSupprimerTriggers_();
+    let state = amazonGetState_();
+    if (!state || state.status === 'ARRETE' || state.status === 'TERMINE') return amazonEtatUi_(state);
+    state.updatedAt = new Date().toISOString();
+
+    if (state.phase === 'SCAN') {
+      state = amazonTraiterLotPdf_(state);
+      amazonSaveState_(state);
+      amazonMettreAJourProgress_(getSpreadsheet_(), state, state.phase === 'MATCH' ? 'Lecture des PDF terminée. Préparation du rapprochement bancaire…' : 'Lecture des PDF en cours…');
+      if (state.phase === 'MATCH') {
+        try { amazonProgrammerSuite_(3000); } catch (e) {}
+      } else if (state.status === 'ACTIF') {
+        try { amazonProgrammerSuite_(AMAZON_PDF.TRIGGER_DELAY_MS); } catch (e) {}
+      }
+      return amazonEtatUi_(state);
+    }
+
+    if (state.phase === 'MATCH') {
+      amazonMettreAJourProgress_(getSpreadsheet_(), state, 'Rapprochement avec les mouvements CBC en cours…');
+      amazonFinaliserRapprochement_(state);
+      state = amazonGetState_() || state;
+      state.status = 'TERMINE';
+      state.phase = 'DONE';
+      state.updatedAt = new Date().toISOString();
+      amazonSaveState_(state);
+      amazonSupprimerTriggers_();
+      return amazonEtatUi_(state);
+    }
+    return amazonEtatUi_(state);
+  } catch (e) {
+    const state = amazonGetState_() || {};
+    state.status = 'ERREUR';
+    state.lastError = String(e && e.message ? e.message : e);
+    state.updatedAt = new Date().toISOString();
+    amazonSaveState_(state);
+    amazonSupprimerTriggers_();
+    try { amazonMettreAJourProgress_(getSpreadsheet_(), state, 'ERREUR : ' + state.lastError); } catch (x) {}
+    console.error(e && e.stack ? e.stack : e);
+    return amazonEtatUi_(state);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function amazonTraiterLotPdf_(state) {
+  const ss = getSpreadsheet_();
+  const qsh = ss.getSheetByName(AMAZON_PDF.QUEUE_SHEET);
+  const dsh = ss.getSheetByName(AMAZON_PDF.DATA_SHEET);
+  if (!qsh || !dsh) throw new Error('Les feuilles techniques du contrôle PDF sont introuvables. Relance le contrôle.');
+  const last = qsh.getLastRow();
+  if (last < 2) { state.phase = 'MATCH'; return state; }
+  const rows = qsh.getRange(2,1,last-1,6).getValues();
+  const deadline = Date.now() + AMAZON_PDF.BATCH_MAX_MS;
+  let doneThisRun = 0;
+
+  for (let i=0; i<rows.length; i++) {
+    if (Date.now() >= deadline || doneThisRun >= AMAZON_PDF.MAX_FILES_PER_BATCH) break;
+    if (String(rows[i][3] || '') !== 'EN ATTENTE') continue;
+    const fileId = String(rows[i][0] || '');
+    const fileName = String(rows[i][1] || '');
+    const path = String(rows[i][2] || '');
+    try {
+      // Sécurité supplémentaire si un récapitulatif était déjà présent dans une
+      // ancienne file technique avant mise à jour du script.
+      if (amazonEstRecapitulatif_(fileName)) {
+        qsh.getRange(i+2,4,1,3).setValues([['IGNORÉ', 0, 'Récapitulatif Amazon — pas une facture']]);
+        state.processed = Number(state.processed || 0) + 1;
+        state.updatedAt = new Date().toISOString();
+        doneThisRun++;
+        amazonSaveState_(state);
+        try { amazonMettreAJourProgress_(ss, state, 'Ignoré (récapitulatif) : ' + fileName); } catch (e) {}
+        continue;
+      }
+      const file = DriveApp.getFileById(fileId);
+      const text = frLirePdfTexte_(file);
+      const entries = amazonParserPdf_(text, fileName, fileId, path);
+      if (!entries.length) throw new Error('Aucune facture reconnue dans le PDF.');
+      amazonAppendData_(dsh, entries);
+      qsh.getRange(i+2,4,1,3).setValues([['OK', entries.length, '']]);
+      state.invoices = Number(state.invoices || 0) + entries.length;
+    } catch (e) {
+      const msg = String(e && e.message ? e.message : e);
+      qsh.getRange(i+2,4,1,3).setValues([['ERREUR', 0, msg]]);
+      amazonAppendErreur_(ss, fileId, fileName, path, msg);
+      state.errors = Number(state.errors || 0) + 1;
+    }
+    state.processed = Number(state.processed || 0) + 1;
+    state.updatedAt = new Date().toISOString();
+    doneThisRun++;
+    amazonSaveState_(state);
+    try { amazonMettreAJourProgress_(ss, state, 'Lecture : ' + fileName); } catch (e) {}
+  }
+
+  const remaining = qsh.getRange(2,4,last-1,1).getDisplayValues().some(r => String(r[0] || '') === 'EN ATTENTE');
+  if (!remaining) state.phase = 'MATCH';
+  return state;
+}
+
+function amazonParserPdf_(text, fileName, fileId, path) {
+  const raw = amazonNormaliserTextePdf_(text);
+  let entries = amazonParserStandard_(raw);
+  if (!entries.length) entries = amazonParserMarketplace_(raw);
+  const fileOrder = amazonExtraireCommande_(fileName);
+  return entries.map((e, idx) => {
+    const order = String(e.orderNumber || '');
+    return {
+      fileId:fileId, fileName:fileName, path:path, index:idx+1,
+      pdfType:e.pdfType || '', seller:e.seller || '', buyer:e.buyer || '', buyerVat:e.buyerVat || '',
+      invoiceNumber:e.invoiceNumber || '', orderNumber:order, paymentRef:e.paymentRef || '',
+      invoiceDate:e.invoiceDate || null, amount:arrondir2_(Number(e.amount || 0)), currency:e.currency || 'EUR',
+      fileOrder:fileOrder || '', nameMatches:(fileOrder && order) ? (fileOrder === order ? 'OUI' : 'NON') : '',
+      keyText:[e.invoiceNumber,e.orderNumber,e.paymentRef,e.seller].filter(Boolean).join(' | ')
+    };
+  }).filter(e => e.amount > 0 && (e.invoiceNumber || e.orderNumber || e.paymentRef));
+}
+
+function amazonNormaliserTextePdf_(text) {
+  return String(text || '')
+    .replace(/\u00A0|\u202F/g, ' ')
+    .replace(/[‐‑–—]/g, '-')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[\u000B\u000C\u0085\u2028\u2029]/g, '\n')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n');
+}
+
+function amazonParserStandard_(raw) {
+  const entries = [];
+  const re = /Détails de la facture([\s\S]*?)(?=Informations de la commande|Détails de la facture|$)/gi;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const b = m[1] || '';
+    const invoiceNumber = amazonMatch_(b, /Numéro de la facture\s+([^\s\n]+)/i);
+    const orderNumber = amazonMatch_(b, /Numéro de la commande\s+(\d{3}-\d{7}-\d{7})/i);
+    const paymentRef = amazonMatch_(b, /Référence de paiement\s+([A-Za-z0-9_-]+)/i);
+    const seller = amazonMatch_(b, /Vendu par\s+([^\n]+)/i).replace(/\s+$/,'');
+    const dateTxt = amazonMatch_(b, /Date de la facture\/Date de la livraison\s+([^\n]+)/i) || amazonMatch_(b, /Date de la facture\s+([^\n]+)/i);
+    const amountTxt = amazonMatch_(b, /Total à payer\s+([\d\s.,]+)\s*(?:€|EUR)/i);
+    const buyer = amazonMatch_(b, /Adresse commerciale\s+([^\n]+)/i);
+    const buyerVat = amazonMatch_(b, /Adresse commerciale[\s\S]{0,350}?TVA\s+(BE\s*\d{10})/i).replace(/\s+/g,'');
+    const amount = convertirNombre_(amountTxt);
+    if (!invoiceNumber && !orderNumber) continue;
+    if (amount === null || amount <= 0) continue;
+    entries.push({pdfType:'AMAZON', seller:seller, buyer:buyer, buyerVat:buyerVat, invoiceNumber:invoiceNumber,
+      orderNumber:orderNumber, paymentRef:paymentRef, invoiceDate:amazonParseDate_(dateTxt), amount:amount, currency:'EUR'});
+  }
+  return amazonDedoublonnerParse_(entries);
+}
+
+function amazonParserMarketplace_(raw) {
+  const orderNumbers = amazonMatchesUniques_(raw, /\b(\d{3}-\d{7}-\d{7})\b/g);
+  const invoiceNumber = amazonMatch_(raw, /Rechnungsnr\.?\s*[:\-]?\s*([^\s\n]+)/i) ||
+    amazonMatch_(raw, /Rechnungs[-\s]?Nr\.?\s*[:\-]?\s*([^\s\n]+)/i) ||
+    amazonMatch_(raw, /Invoice\s*(?:Number|No\.?|#)?\s*[:\-]?\s*([A-Z0-9][A-Z0-9\/_\-.]{3,})/i) ||
+    amazonMatch_(raw, /(?:Numéro|No\.?|N°)\s*(?:de\s+la\s+)?facture\s*[:\-]?\s*([^\s\n]+)/i);
+  let amountTxt = amazonMatch_(raw, /Gesamtbetrag\s*[:\-]?\s*([\d\s.,]+)\s*(?:EUR|€)/i) ||
+    amazonMatch_(raw, /Rechnungsbetrag\s*[:\-]?\s*([\d\s.,]+)\s*(?:EUR|€)/i) ||
+    amazonMatch_(raw, /Gesamtpreis(?:\s+Euro)?\s*(?:EUR)?\s*[:\-]?\s*([\d\s.,]+)\s*(?:EUR|€)/i) ||
+    amazonMatch_(raw, /(?:Grand\s+Total|Invoice\s+Total|Total\s+Due|Total\s+à\s+payer)\s*[:\-]?\s*([\d\s.,]+)\s*(?:EUR|€)/i);
+  const amount = convertirNombre_(amountTxt);
+  if ((!invoiceNumber && !orderNumbers.length) || amount === null || amount <= 0) return [];
+
+  let dateTxt = amazonMatch_(raw, /Rechnungsdatum\s*[:\-]?\s*([^\n]+)/i) ||
+    amazonMatch_(raw, /Rechnung\s*\n\s*(\d{1,2}[.\/-]\d{1,2}[.\/-]\d{4})/i) ||
+    amazonMatch_(raw, /Invoice\s+Date\s*[:\-]?\s*([^\n]+)/i) ||
+    amazonMatch_(raw, /Date\s+(?:de\s+la\s+)?facture\s*[:\-]?\s*([^\n]+)/i);
+
+  const lines = raw.split('\n').map(x=>x.trim()).filter(Boolean);
+  let seller = '';
+  for (let i=0;i<Math.min(lines.length,30);i++) {
+    const line = lines[i];
+    if (/cernigliaro|as\s+plafonn|as\s+construct/i.test(line)) continue;
+    if (/amazon\.(fr|de|it|es)|amazon eu/i.test(line)) continue;
+    if (/\b(?:GmbH|Ltd\.?|Limited|SAS|SARL|SRL|BV|B\.V\.|OOD|Sp\.?\s*z\.?\s*o\.?o\.?|S\.A\.?|Srl)\b/i.test(line)) { seller=line; break; }
+  }
+
+  const buyerVat = (amazonMatch_(raw, /(?:Ihre\s+Ust-ID|USt-IDNr\.\s+des\s+Empfängers|TVA)\s*[:]?\s*(BE\s*\d{10})/i) ||
+    amazonMatch_(raw, /\b(BE\s*\d{10})\b/i)).replace(/\s+/g,'');
+  const orderNumber = orderNumbers.length ? orderNumbers[orderNumbers.length-1] : '';
+  return [{pdfType:'MARKETPLACE', seller:seller, buyer:'', buyerVat:buyerVat, invoiceNumber:invoiceNumber,
+    orderNumber:orderNumber, paymentRef:'', invoiceDate:amazonParseDate_(dateTxt), amount:amount, currency:'EUR'}];
+}
+
+function amazonMatch_(text, re) {
+  const m = String(text || '').match(re);
+  return m ? String(m[1] || '').trim() : '';
+}
+
+function amazonMatchesUniques_(text, re) {
+  const out = [], seen = new Set(); let m;
+  while ((m = re.exec(String(text || ''))) !== null) {
+    const v = String(m[1] || m[0] || '').trim();
+    if (v && !seen.has(v)) { seen.add(v); out.push(v); }
+    if (re.lastIndex === m.index) re.lastIndex++;
+  }
+  return out;
+}
+
+function amazonDedoublonnerParse_(entries) {
+  const out=[], seen=new Set();
+  (entries||[]).forEach(e=>{
+    const key=frNormaliserReference_(e.invoiceNumber||'')+'|'+frNormaliserReference_(e.orderNumber||'')+'|'+Math.round(Number(e.amount||0)*100);
+    if(!seen.has(key)){seen.add(key);out.push(e);}
+  });
+  return out;
+}
+
+function amazonParseDate_(value) {
+  if (value instanceof Date) return value;
+  let s = String(value || '').trim();
+  if (!s) return null;
+  const frMonths = {janvier:1,fevrier:2,février:2,mars:3,avril:4,mai:5,juin:6,juillet:7,aout:8,août:8,septembre:9,octobre:10,novembre:11,decembre:12,décembre:12};
+  const norm = normaliserRecherche_(s);
+  const m = norm.match(/(\d{1,2})\s+(janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)\s+(\d{4})/i);
+  if (m) return dateValide_(Number(m[3]), frMonths[m[2].toLowerCase()], Number(m[1]));
+  return convertirDate_(s);
+}
+
+function amazonExtraireCommande_(value) {
+  const m = String(value || '').match(/\b(\d{3}-\d{7}-\d{7})\b/);
+  return m ? m[1] : '';
+}
+
+function amazonAppendData_(sheet, entries) {
+  if (!entries || !entries.length) return;
+  const row = Math.max(2, sheet.getLastRow()+1);
+  assurerNombreLignes_(sheet, row + entries.length + 2);
+  const vals = entries.map(e => [e.fileId,e.fileName,e.path,e.index,e.pdfType,e.seller,e.buyer,e.buyerVat,e.invoiceNumber,e.orderNumber,e.paymentRef,e.invoiceDate||'',e.amount,e.currency,e.fileOrder,e.nameMatches,e.keyText]);
+  sheet.getRange(row,1,vals.length,17).setValues(vals);
+  sheet.getRange(row,12,vals.length,1).setNumberFormat('dd/MM/yyyy');
+  sheet.getRange(row,13,vals.length,1).setNumberFormat('#,##0.00');
+}
+
+function amazonAppendErreur_(ss, fileId, fileName, path, msg) {
+  let sh = ss.getSheetByName(AMAZON_PDF.ERROR_SHEET);
+  if (!sh) sh = amazonPrepareSheet_(ss, AMAZON_PDF.ERROR_SHEET, ['Fichier','Chemin','Erreur','Lien PDF'], false);
+  const r = Math.max(2, sh.getLastRow()+1);
+  assurerNombreLignes_(sh, r+2);
+  sh.getRange(r,1,1,3).setValues([[fileName,path,msg]]);
+  sh.getRange(r,4).setRichTextValue(SpreadsheetApp.newRichTextValue().setText('Ouvrir PDF').setLinkUrl('https://drive.google.com/file/d/'+fileId+'/view').build());
+}
+
+function amazonLireDonnees_(ss) {
+  const sh = ss.getSheetByName(AMAZON_PDF.DATA_SHEET);
+  if (!sh || sh.getLastRow()<2) return [];
+  const vals = sh.getRange(2,1,sh.getLastRow()-1,17).getValues();
+  return vals.map((r,i)=>({
+    idx:i, fileId:String(r[0]||''), fileName:String(r[1]||''), path:String(r[2]||''), invoiceIndex:Number(r[3]||0), pdfType:String(r[4]||''),
+    seller:String(r[5]||''), buyer:String(r[6]||''), buyerVat:String(r[7]||''), invoiceNumber:String(r[8]||''), orderNumber:String(r[9]||''), paymentRef:String(r[10]||''),
+    invoiceDate:convertirDate_(r[11]), amount:arrondir2_(Number(r[12]||0)), currency:String(r[13]||'EUR'), fileOrder:String(r[14]||''), nameMatches:String(r[15]||''), keyText:String(r[16]||'')
+  })).filter(x=>x.amount>0);
+}
+
+function amazonFinaliserRapprochement_(state) {
+  const ss = getSpreadsheet_();
+  const invoices = amazonLireDonnees_(ss);
+  if (!invoices.length) throw new Error('Aucune facture exploitable n’a été extraite des PDF. Consulte FACTURES-PDF-ERREURS.');
+  const bank = frLireTransactionsBanque_(ss, state.bankSheets || CBC.ACCOUNTS.map(a=>a.sheet)).filter(t=>t.amount<0);
+  const result = amazonRapprocherFactures_(invoices, bank);
+  amazonEcrireResultats_(ss, state, invoices, result);
+}
+
+function amazonRapprocherFactures_(invoices, bank) {
+  const matches = new Array(invoices.length).fill(null);
+  const usedBank = new Set();
+  const duplicateOf = {};
+  const firstByKey = {};
+
+  invoices.forEach((inv,i)=>{
+    const key = inv.invoiceNumber ? 'I:'+frNormaliserReference_(inv.invoiceNumber) :
+      'O:'+frNormaliserReference_(inv.orderNumber)+'|'+Math.round(inv.amount*100)+'|'+(inv.invoiceDate?inv.invoiceDate.getTime():'');
+    if (firstByKey[key] !== undefined) duplicateOf[i] = firstByKey[key]; else firstByKey[key] = i;
+  });
+
+  const activeIdx = invoices.map((x,i)=>i).filter(i=>duplicateOf[i]===undefined);
+
+  // 1) Paiements groupés portant la même référence de paiement Amazon.
+  const groups = {};
+  activeIdx.forEach(i=>{
+    const inv=invoices[i];
+    const pr=frNormaliserReference_(inv.paymentRef||'');
+    if(!pr) return;
+    const key='P:'+pr;
+    if(!groups[key]) groups[key]=[];
+    groups[key].push(i);
+  });
+  Object.keys(groups).forEach(key=>{
+    const idxs=groups[key]; if(idxs.length<2) return;
+    const total=arrondir2_(idxs.reduce((s,i)=>s+invoices[i].amount,0));
+    const ref=frNormaliserReference_(invoices[idxs[0]].paymentRef);
+    const candidates=bank.filter(p=>!usedBank.has(p.id) && Math.abs(Math.abs(p.amount)-total)<=0.02)
+      .map(p=>({p:p, refHit:amazonBankText_(p).indexOf(ref)!==-1, amazon:amazonEstAmazonBanque_(p), days:amazonDaysFromGroup_(idxs,invoices,p.date)}))
+      .filter(x=>x.refHit || (x.amazon && x.days>=-5 && x.days<=45))
+      .sort((a,b)=>(b.refHit?1:0)-(a.refHit?1:0) || Math.abs(a.days)-Math.abs(b.days));
+    if(!candidates.length) return;
+    const best=candidates[0];
+    if(best.refHit){
+      usedBank.add(best.p.id);
+      idxs.forEach(i=>matches[i]={statusCode:'PAID_GROUP',status:'✅ Payée — paiement groupé Amazon',score:100,payment:best.p,paid:invoices[i].amount,gap:0,note:'Un seul débit bancaire couvre '+idxs.length+' factures partageant la même référence de paiement '+invoices[i].paymentRef+'.'});
+    } else if(candidates.length===1 && best.amazon && best.days>=-2 && best.days<=30){
+      idxs.forEach(i=>matches[i]={statusCode:'PROB_GROUP',status:'🟠 À vérifier — paiement groupé probable',score:88,payment:best.p,paid:0,gap:invoices[i].amount,note:'Le débit Amazon correspond exactement au total des '+idxs.length+' factures, mais la référence de paiement n’apparaît pas dans la banque. Validation manuelle conseillée.'});
+    }
+  });
+
+  // 2) Facture individuelle : référence forte + montant exact.
+  activeIdx.forEach(i=>{
+    if(matches[i]) return;
+    const inv=invoices[i];
+    const candidates=bank.filter(p=>!usedBank.has(p.id)).map(p=>amazonScoreTransaction_(inv,p)).filter(x=>x.amountExact && x.refHit).sort((a,b)=>b.score-a.score || Math.abs(a.days)-Math.abs(b.days));
+    if(!candidates.length) return;
+    const best=candidates[0]; usedBank.add(best.p.id);
+    matches[i]={statusCode:'PAID',status:'✅ Payée — référence confirmée',score:best.score,payment:best.p,paid:inv.amount,gap:0,note:best.refLabel+' retrouvé dans la banque avec montant exact.'};
+  });
+
+  // 3) Même commande Amazon : plusieurs factures sans référence de paiement exploitable.
+  const orderGroups={};
+  activeIdx.forEach(i=>{
+    if(matches[i]) return;
+    const o=frNormaliserReference_(invoices[i].orderNumber||''); if(!o)return;
+    const key='O:'+o;if(!orderGroups[key])orderGroups[key]=[];orderGroups[key].push(i);
+  });
+  Object.keys(orderGroups).forEach(key=>{
+    const idxs=orderGroups[key];if(idxs.length<2)return;
+    const total=arrondir2_(idxs.reduce((s,i)=>s+invoices[i].amount,0));
+    const ref=frNormaliserReference_(invoices[idxs[0]].orderNumber);
+    const candidates=bank.filter(p=>!usedBank.has(p.id)&&Math.abs(Math.abs(p.amount)-total)<=0.02).map(p=>({p:p,refHit:amazonBankText_(p).indexOf(ref)!==-1,amazon:amazonEstAmazonBanque_(p),days:amazonDaysFromGroup_(idxs,invoices,p.date)})).filter(x=>x.refHit||(x.amazon&&x.days>=-5&&x.days<=45)).sort((a,b)=>(b.refHit?1:0)-(a.refHit?1:0)||Math.abs(a.days)-Math.abs(b.days));
+    if(!candidates.length)return;
+    const best=candidates[0];
+    if(best.refHit){
+      usedBank.add(best.p.id);
+      idxs.forEach(i=>matches[i]={statusCode:'PAID_GROUP',status:'✅ Payée — commande groupée',score:98,payment:best.p,paid:invoices[i].amount,gap:0,note:'Débit bancaire correspondant au total de '+idxs.length+' factures de la commande '+invoices[i].orderNumber+'.'});
+    } else if(candidates.length===1){
+      idxs.forEach(i=>matches[i]={statusCode:'PROB_GROUP',status:'🟠 À vérifier — commande groupée probable',score:84,payment:best.p,paid:0,gap:invoices[i].amount,note:'Le débit Amazon correspond au total des '+idxs.length+' factures de la commande, mais le numéro de commande n’apparaît pas dans la banque.'});
+    }
+  });
+
+  // 4) Montant exact + Amazon/vendeur + date : candidat prudent, non confirmé automatiquement.
+  activeIdx.forEach(i=>{
+    if(matches[i]) return;
+    const inv=invoices[i];
+    const candidates=bank.filter(p=>!usedBank.has(p.id)).map(p=>amazonScoreTransaction_(inv,p)).filter(x=>x.amountExact && (x.amazon || x.sellerHit) && x.days>=-5 && x.days<=60).sort((a,b)=>b.score-a.score || Math.abs(a.days)-Math.abs(b.days));
+    if(candidates.length===1 || (candidates.length>1 && candidates[0].score>=candidates[1].score+15)) {
+      const best=candidates[0];
+      matches[i]={statusCode:'PROB',status:'🟠 À vérifier — montant/date',score:best.score,payment:best.p,paid:0,gap:inv.amount,note:'Montant exact et contrepartie/date cohérentes, mais aucune référence unique de facture/commande n’a été retrouvée. Le paiement n’est pas confirmé automatiquement.'};
+    } else {
+      matches[i]={statusCode:'NONE',status:'❌ Paiement non trouvé',score:0,payment:null,paid:0,gap:inv.amount,note:candidates.length?'Plusieurs paiements possibles avec le même montant : contrôle manuel nécessaire.':'Aucun paiement suffisamment fiable trouvé.'};
+    }
+  });
+
+  Object.keys(duplicateOf).forEach(k=>{
+    const i=Number(k), orig=duplicateOf[k];
+    matches[i]={statusCode:'DUP',status:'⚠️ Doublon PDF',score:0,payment:null,paid:0,gap:0,note:'Même facture déjà détectée dans '+invoices[orig].fileName+'. Elle n’est pas comptée une seconde fois.'};
+  });
+
+  return {matches:matches, usedBank:usedBank, duplicateOf:duplicateOf};
+}
+
+function amazonScoreTransaction_(inv,p) {
+  const bankText=amazonBankText_(p);
+  const refs=[['référence paiement',inv.paymentRef],['commande',inv.orderNumber],['facture',inv.invoiceNumber]].filter(x=>x[1]);
+  let refHit=false, refLabel='';
+  refs.forEach(x=>{const n=frNormaliserReference_(x[1]);if(!refHit&&n&&bankText.indexOf(n)!==-1){refHit=true;refLabel=x[0];}});
+  const amountExact=Math.abs(Math.abs(p.amount)-inv.amount)<=0.02;
+  const amazon=amazonEstAmazonBanque_(p);
+  const sellerHit=amazonNomProche_(inv.seller, p.name+' '+p.description);
+  const days=inv.invoiceDate?Math.round((p.date-inv.invoiceDate)/86400000):9999;
+  let score=0;if(refHit)score+=60;if(amountExact)score+=30;if(amazon)score+=15;if(sellerHit)score+=18;if(days>=-2&&days<=14)score+=12;else if(days>=-5&&days<=45)score+=7;else if(days< -5)score-=20;
+  return {p:p,score:score,refHit:refHit,refLabel:refLabel,amountExact:amountExact,amazon:amazon,sellerHit:sellerHit,days:days};
+}
+
+function amazonBankText_(p) {
+  return frNormaliserReference_([p.name,p.description,p.communication,p.counterpartyAccount].join(' '));
+}
+
+function amazonEstAmazonBanque_(p) {
+  const n=normaliserRecherche_([p.name,p.description,p.communication].join(' '));
+  return /\bamazon\b|\bamzn\b|amazon\s*eu|amazon\.fr|amazon\.de/i.test(n);
+}
+
+function amazonNomProche_(seller, bankName) {
+  const a=normaliserRecherche_(seller||'').replace(/\b(gmbh|limited|ltd|sarl|sas|srl|bv|ood|sa|company|co)\b/g,' ').replace(/\s+/g,' ').trim();
+  const b=normaliserRecherche_(bankName||'');
+  if(!a||a.length<4||!b)return false;
+  if(b.indexOf(a)!==-1)return true;
+  const tokens=a.split(' ').filter(x=>x.length>=4);
+  return tokens.length>=2 ? tokens.filter(t=>b.indexOf(t)!==-1).length>=2 : (tokens.length===1 && b.indexOf(tokens[0])!==-1);
+}
+
+function amazonDaysFromGroup_(idxs,invoices,paymentDate) {
+  const dates=idxs.map(i=>invoices[i].invoiceDate).filter(Boolean).sort((a,b)=>a-b);
+  if(!dates.length)return 9999;
+  const latest=dates[dates.length-1];
+  return Math.round((paymentDate-latest)/86400000);
+}
+
+function amazonEcrireResultats_(ss,state,invoices,result) {
+  let sh=ss.getSheetByName(AMAZON_PDF.RESULT_SHEET);if(!sh)sh=ss.insertSheet(AMAZON_PDF.RESULT_SHEET);
+  const old=sh.getFilter();if(old)old.remove();try{sh.getBandings().forEach(b=>b.remove());}catch(e){}try{sh.getRange(1,1,sh.getMaxRows(),Math.min(24,sh.getMaxColumns())).breakApart();}catch(e){}
+  sh.clear();if(sh.getMaxColumns()<24)sh.insertColumnsAfter(sh.getMaxColumns(),24-sh.getMaxColumns());assurerNombreLignes_(sh,Math.max(120,invoices.length+12));
+
+  const uniqueIdx=invoices.map((x,i)=>i).filter(i=>result.duplicateOf[i]===undefined);
+  const totalInvoices=arrondir2_(uniqueIdx.reduce((s,i)=>s+invoices[i].amount,0));
+  const totalConfirmed=arrondir2_(uniqueIdx.reduce((s,i)=>s+((result.matches[i]&&/^PAID/.test(result.matches[i].statusCode))?invoices[i].amount:0),0));
+  const totalProb=arrondir2_(uniqueIdx.reduce((s,i)=>s+((result.matches[i]&&result.matches[i].statusCode==='PROB')?invoices[i].amount:0),0));
+  const totalMissing=arrondir2_(uniqueIdx.reduce((s,i)=>s+((result.matches[i]&&result.matches[i].statusCode==='NONE')?invoices[i].amount:0),0));
+
+  sh.getRange('A1:X1').merge().setValue('CONTROLE FACTURES PDF — AMAZON / FOURNISSEURS MARKETPLACE').setFontSize(15).setFontWeight('bold').setFontColor('#fff').setBackground('#1a73e8').setHorizontalAlignment('center');
+  sh.getRange('A2:X2').merge().setValue('Dossier : '+state.folderName+'  |  PDF : '+state.queued+'  |  Factures détectées : '+invoices.length+'  |  Erreurs PDF : '+state.errors).setBackground('#e8f0fe').setFontColor('#174ea6');
+  sh.getRange('A3').setValue('Montant factures uniques').setFontWeight('bold');sh.getRange('B3').setValue(totalInvoices).setNumberFormat('#,##0.00');
+  sh.getRange('D3').setValue('Confirmé banque').setFontWeight('bold');sh.getRange('E3').setValue(totalConfirmed).setNumberFormat('#,##0.00');
+  sh.getRange('G3').setValue('À vérifier').setFontWeight('bold');sh.getRange('H3').setValue(totalProb).setNumberFormat('#,##0.00');
+  sh.getRange('J3').setValue('Non trouvé').setFontWeight('bold');sh.getRange('K3').setValue(totalMissing).setNumberFormat('#,##0.00');
+
+  const headers=['Statut','Type PDF','Fournisseur','Société facturée','TVA client','N° facture','N° commande Amazon','Référence paiement','Date facture','Montant facture','Nom PDF cohérent','Fichier PDF','Chemin','Onglet banque','Date paiement','Montant paiement','Nom banque','Description banque','Communication','Score','Écart','Ouvrir PDF','Ouvrir banque','Note'];
+  sh.getRange(5,1,1,headers.length).setValues([headers]).setFontWeight('bold').setFontColor('#fff').setBackground('#5f6368').setHorizontalAlignment('center');
+  const values=invoices.map((inv,i)=>{const m=result.matches[i]||{status:'❌ Paiement non trouvé',score:0,payment:null,gap:inv.amount,note:''};const p=m.payment;let note=m.note||'';if(inv.nameMatches==='NON')note+=(note?' ':'')+'⚠️ Le n° de commande dans le nom du PDF ('+inv.fileOrder+') ne correspond pas au contenu ('+inv.orderNumber+').';return [m.status,inv.pdfType,inv.seller,inv.buyer,inv.buyerVat,inv.invoiceNumber,inv.orderNumber,inv.paymentRef,inv.invoiceDate||'',inv.amount,inv.nameMatches||'',inv.fileName,inv.path,p?p.sheet:'',p?p.date:'',p?Math.abs(p.amount):'',p?p.name:'',p?p.description:'',p?p.communication:'',m.score||0,m.gap===undefined?'':m.gap,'','',note];});
+  if(values.length){sh.getRange(6,1,values.length,24).setValues(values);sh.getRange(6,9,values.length,1).setNumberFormat('dd/MM/yyyy');sh.getRange(6,10,values.length,1).setNumberFormat('#,##0.00');sh.getRange(6,15,values.length,1).setNumberFormat('dd/MM/yyyy');sh.getRange(6,16,values.length,1).setNumberFormat('#,##0.00');sh.getRange(6,21,values.length,1).setNumberFormat('#,##0.00');
+    const pdfLinks=invoices.map(inv=>[SpreadsheetApp.newRichTextValue().setText('Ouvrir PDF').setLinkUrl('https://drive.google.com/file/d/'+inv.fileId+'/view').build()]);sh.getRange(6,22,pdfLinks.length,1).setRichTextValues(pdfLinks);
+    const base=ss.getUrl().replace(/#.*$/,'');const bankLinks=invoices.map((inv,i)=>{const p=result.matches[i]&&result.matches[i].payment;if(!p)return [SpreadsheetApp.newRichTextValue().setText('').build()];return [SpreadsheetApp.newRichTextValue().setText('Ouvrir').setLinkUrl(base+'#gid='+p.sheetId+'&range=A'+p.row).build()];});sh.getRange(6,23,bankLinks.length,1).setRichTextValues(bankLinks);
+    sh.getRange(5,1,values.length+1,24).createFilter();try{sh.getRange(6,1,values.length,24).applyRowBanding(SpreadsheetApp.BandingTheme.LIGHT_GREY);}catch(e){}
+    for(let i=0;i<values.length;i++){const status=String(values[i][0]||'');const cell=sh.getRange(i+6,1);if(status.indexOf('✅')===0)cell.setBackground('#d9ead3');else if(status.indexOf('🟠')===0||status.indexOf('⚠️')===0)cell.setBackground('#fff2cc');else if(status.indexOf('❌')===0)cell.setBackground('#f4cccc');}
+  }
+  sh.setFrozenRows(5);const widths=[230,105,200,175,115,150,175,160,95,105,115,240,300,120,95,110,180,260,260,70,95,90,90,420];widths.forEach((w,i)=>sh.setColumnWidth(i+1,w));sh.getRange(1,1,Math.max(6,values.length+5),24).setVerticalAlignment('middle');if(values.length)sh.getRange(6,1,values.length,24).setWrap(true);
+  ss.setActiveSheet(sh);sh.activate();
+}
+
+function amazonPrepareSheet_(ss,name,headers,hidden) {
+  let sh=ss.getSheetByName(name);if(!sh)sh=ss.insertSheet(name);const f=sh.getFilter();if(f)f.remove();try{sh.getBandings().forEach(b=>b.remove());}catch(e){}try{sh.showSheet();}catch(e){}sh.clear();
+  if(headers&&headers.length){if(sh.getMaxColumns()<headers.length)sh.insertColumnsAfter(sh.getMaxColumns(),headers.length-sh.getMaxColumns());sh.getRange(1,1,1,headers.length).setValues([headers]).setFontWeight('bold').setBackground('#eeeeee');sh.setFrozenRows(1);}
+  if(hidden){try{sh.hideSheet();}catch(e){}}
+  return sh;
+}
+
+function amazonMettreAJourProgress_(ss, state, message) {
+  let sh = ss.getSheetByName(AMAZON_PDF.RESULT_SHEET);
+  if (!sh) sh = ss.insertSheet(AMAZON_PDF.RESULT_SHEET);
+  try { sh.showSheet(); } catch (e) {}
+  if (state && state.status !== 'TERMINE' && state.phase !== 'DONE') {
+    try { sh.getRange('A1:H10').breakApart(); } catch (e) {}
+    sh.getRange('A1:H10').clearContent().clearFormat();
+    sh.getRange('A1:H1').merge().setValue('CONTROLE FACTURES PDF — ANALYSE EN COURS').setFontSize(15).setFontWeight('bold').setFontColor('#fff').setBackground('#1a73e8').setHorizontalAlignment('center');
+    sh.getRange('A3').setValue('Dossier').setFontWeight('bold'); sh.getRange('B3:H3').merge().setValue(state.folderName || '');
+    sh.getRange('A4').setValue('Statut').setFontWeight('bold'); sh.getRange('B4').setValue(state.status || '');
+    sh.getRange('C4').setValue('Phase').setFontWeight('bold'); sh.getRange('D4').setValue(state.phase || '');
+    sh.getRange('A5').setValue('PDF traités').setFontWeight('bold'); sh.getRange('B5').setValue(Number(state.processed || 0));
+    sh.getRange('C5').setValue('PDF total').setFontWeight('bold'); sh.getRange('D5').setValue(Number(state.queued || 0));
+    sh.getRange('E5').setValue('Factures détectées').setFontWeight('bold'); sh.getRange('F5').setValue(Number(state.invoices || 0));
+    sh.getRange('G5').setValue('Erreurs PDF').setFontWeight('bold'); sh.getRange('H5').setValue(Number(state.errors || 0));
+    sh.getRange('A7').setValue('Progression').setFontWeight('bold');
+    const pct = Number(state.queued || 0) ? Number(state.processed || 0) / Number(state.queued || 1) : 0;
+    sh.getRange('B7').setValue(pct).setNumberFormat('0.0%');
+    sh.getRange('A8').setValue('Message').setFontWeight('bold'); sh.getRange('B8:H8').merge().setValue(message || '');
+    sh.getRange('A9').setValue('Dernière mise à jour').setFontWeight('bold'); sh.getRange('B9').setValue(new Date()).setNumberFormat('dd/MM/yyyy HH:mm:ss');
+    if (state.lastError) { sh.getRange('A10').setValue('Dernière erreur').setFontWeight('bold'); sh.getRange('B10:H10').merge().setValue(state.lastError).setBackground('#f4cccc'); }
+    sh.setColumnWidth(1, 150); for (let c=2;c<=8;c++) sh.setColumnWidth(c, 130);
+  }
+}
+
+function amazonEtatUi_(s) {
+  if (!s) return {exists:false,status:'',phase:'',queued:0,processed:0,invoices:0,errors:0,lastError:''};
+  return {exists:true,status:s.status||'',phase:s.phase||'',folderName:s.folderName||'',queued:Number(s.queued||0),processed:Number(s.processed||0),invoices:Number(s.invoices||0),errors:Number(s.errors||0),lastError:s.lastError||'',updatedAt:s.updatedAt||''};
+}
+
+function amazonGetEtatControlePdf() {
+  return amazonEtatUi_(amazonGetState_());
+}
+
+function amazonGetState_() {
+  const raw=PropertiesService.getDocumentProperties().getProperty(AMAZON_PDF.PROP_STATE);if(!raw)return null;try{return JSON.parse(raw);}catch(e){return null;}
+}
+function amazonSaveState_(state) { PropertiesService.getDocumentProperties().setProperty(AMAZON_PDF.PROP_STATE,JSON.stringify(state||{})); }
+function amazonSupprimerTriggers_() { ScriptApp.getProjectTriggers().forEach(t=>{if(t.getHandlerFunction()===AMAZON_PDF.TRIGGER_HANDLER)ScriptApp.deleteTrigger(t);}); }
+function amazonProgrammerSuite_(delayMs) { amazonSupprimerTriggers_();ScriptApp.newTrigger(AMAZON_PDF.TRIGGER_HANDLER).timeBased().after(Math.max(1000,Number(delayMs)||AMAZON_PDF.TRIGGER_DELAY_MS)).create(); }
+
+function amazonAfficherEtatControle() {
+  const s=amazonGetState_();
+  const msg=!s?'Aucun contrôle PDF enregistré.':('Statut : '+s.status+'\nPhase : '+s.phase+'\nDossier : '+(s.folderName||'')+'\nPDF traités : '+(s.processed||0)+' / '+(s.queued||0)+'\nFactures détectées : '+(s.invoices||0)+'\nErreurs PDF : '+(s.errors||0)+(s.lastError?'\nDernière erreur : '+s.lastError:''));
+  SpreadsheetApp.getUi().alert('Contrôle factures PDF',msg,SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function amazonArreterControle() {
+  amazonSupprimerTriggers_();
+  const s=amazonGetState_()||{};s.status='ARRETE';s.updatedAt=new Date().toISOString();amazonSaveState_(s);
+  SpreadsheetApp.getActiveSpreadsheet().toast('Contrôle des factures PDF arrêté.','CBC BANQUE',5);
+}
+
