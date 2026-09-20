@@ -1,0 +1,15 @@
+# CBC - synchronisation Google Apps Script -> GitHub
+# Ce fichier protège contre un éventuel clasp push accidentel.
+
+**/**
+
+!appsscript.json
+!**/*.gs
+!**/*.js
+!**/*.html
+
+.git/**
+Archives/**
+*.bat
+*.ps1
+README-SYNC.md
