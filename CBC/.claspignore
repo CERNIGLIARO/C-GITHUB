@@ -1,15 +1,8 @@
-# CBC - synchronisation Google Apps Script -> GitHub
-# Ce fichier protège contre un éventuel clasp push accidentel.
+# CBC - fichiers autorises pour un clasp push manuel
+# Les anciennes versions .gs du dossier CBC restent exclues pour eviter les doublons de fonctions.
 
 **/**
 
 !appsscript.json
-!**/*.gs
-!**/*.js
-!**/*.html
-
-.git/**
-Archives/**
-*.bat
-*.ps1
-README-SYNC.md
+!Code.gs
+!VentesRapprochement.gs
