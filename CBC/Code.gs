@@ -17,7 +17,7 @@
  */
 
 const CBC = Object.freeze({
-  VERSION: '2.3.6',
+  VERSION: '2.4.0',
   SCAN_SUBFOLDERS: true,
   MAX_SCAN_FOLDERS: 2000,
   CSV_STALE_DAYS: 3,
@@ -72,6 +72,7 @@ function onOpen() {
     .addSeparator()
     .addItem('📑 Rapprochement fournisseurs', 'ouvrirRapprochementFournisseur')
     .addItem('💶 Factures à payer', 'ouvrirFacturesAPayer')
+    .addItem('💰 Rapprocher ventes / paiements', 'rapprocherVentesAS')
     .addSeparator()
     .addItem('🧾 Contrôler un dossier de factures PDF...', 'amazonOuvrirControleFacturesPdf')
     .addItem('▶️ Continuer contrôle factures PDF maintenant', 'amazonContinuerControleFacturesPdf')
